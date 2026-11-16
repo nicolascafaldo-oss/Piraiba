@@ -1,0 +1,480 @@
+package com.example.viewmodel
+
+import android.content.ContentResolver
+import android.content.Context
+import android.net.Uri
+import androidx.core.content.FileProvider
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.capture.AlertConfigStore
+import com.example.capture.AlertMonitor
+import com.example.capture.CaptureRepository
+import com.example.capture.DnsResolutionCache
+import com.example.dissector.DisplayFilterParser
+import com.example.dissector.ParsedDisplayFilter
+import com.example.dissector.PcapCodec
+import com.example.model.AlertThresholdConfig
+import com.example.model.CapturedPacket
+import com.example.model.ConversationStream
+import com.example.model.NetworkAlertEvent
+import com.example.model.PacketDirection
+import com.example.model.PortMonitorMode
+import com.example.model.ProbeType
+import com.example.model.ProtocolStat
+import com.example.model.ProtocolType
+import com.example.model.QuickFilter
+import com.example.model.ResolvedHost
+import com.example.model.ThroughputPoint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+
+data class CaptureUiState(
+    val isCapturing: Boolean = false,
+    val captureStartTimeMs: Long? = null,
+    val totalPacketCount: Long = 0L,
+    val totalBytes: Long = 0L,
+    val packets: List<CapturedPacket> = emptyList(),
+    val filterQuery: String = "",
+    val quickFilter: QuickFilter = QuickFilter.ALL,
+    val filterValidation: ParsedDisplayFilter = ParsedDisplayFilter(isValid = true) { true },
+    val selectedPacketId: Long? = null,
+    val autoScroll: Boolean = true,
+    val throughputHistory: List<ThroughputPoint> = emptyList(),
+    val darkTheme: Boolean = true,
+    val resolveHostnames: Boolean = true,
+    val resolvedDomains: Map<String, ResolvedHost> = emptyMap()
+)
+
+class WireTraceViewModel : ViewModel() {
+
+    private val _filterQuery = MutableStateFlow("")
+    private val _quickFilter = MutableStateFlow(QuickFilter.ALL)
+    private val _selectedPacketId = MutableStateFlow<Long?>(null)
+    private val _autoScroll = MutableStateFlow(true)
+    private val _darkTheme = MutableStateFlow(true)
+    private val _resolveHostnames = MutableStateFlow(true)
+    private val _toastEvent = MutableStateFlow<String?>(null)
+    private val _probeBusy = MutableStateFlow(false)
+    private var appContext: Context? = null
+    private var alertStoreBound = false
+
+    val toastEvent: StateFlow<String?> = _toastEvent.asStateFlow()
+    val probeBusy: StateFlow<Boolean> = _probeBusy.asStateFlow()
+    val alertConfig: StateFlow<AlertThresholdConfig> = AlertMonitor.config
+    val alertEvents: StateFlow<List<NetworkAlertEvent>> = AlertMonitor.alerts
+    val unreadAlertCount: StateFlow<Int> = AlertMonitor.unreadCount
+    val latestAlertEvent: StateFlow<NetworkAlertEvent?> = AlertMonitor.latestAlert
+
+    fun bindAlertStore(context: Context) {
+        if (alertStoreBound) return
+        alertStoreBound = true
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        viewModelScope.launch {
+            AlertConfigStore.observeConfig(appCtx).collect { loaded ->
+                AlertMonitor.updateConfig(loaded)
+            }
+        }
+    }
+
+    fun updateAlertConfig(newConfig: AlertThresholdConfig) {
+        AlertMonitor.updateConfig(newConfig)
+        val ctx = appContext ?: return
+        viewModelScope.launch {
+            runCatching { AlertConfigStore.saveConfig(ctx, newConfig) }
+        }
+    }
+
+    fun addMonitoredPort(port: Int) {
+        if (port !in 1..65535) {
+            _toastEvent.value = "Port must be between 1 and 65535"
+            return
+        }
+        val current = alertConfig.value
+        val updated = if (current.portMonitorMode == PortMonitorMode.WATCHED_PORTS) {
+            current.copy(flaggedPorts = current.flaggedPorts + port)
+        } else {
+            current.copy(allowedPorts = current.allowedPorts + port)
+        }
+        updateAlertConfig(updated)
+    }
+
+    fun removeMonitoredPort(port: Int) {
+        val current = alertConfig.value
+        val updated = if (current.portMonitorMode == PortMonitorMode.WATCHED_PORTS) {
+            current.copy(flaggedPorts = current.flaggedPorts - port)
+        } else {
+            current.copy(allowedPorts = current.allowedPorts - port)
+        }
+        updateAlertConfig(updated)
+    }
+
+    fun resetAlertDefaults() {
+        updateAlertConfig(AlertThresholdConfig())
+        _toastEvent.value = "Alert thresholds reset to defaults"
+    }
+
+    fun clearAlerts() {
+        AlertMonitor.clearAlerts()
+        _toastEvent.value = "Alert log cleared"
+    }
+
+    fun markAlertsRead() {
+        AlertMonitor.markAllRead()
+    }
+
+    fun consumeLatestAlert() {
+        AlertMonitor.consumeLatestAlert()
+    }
+
+    private val parsedFilterFlow: StateFlow<ParsedDisplayFilter> = combine(
+        _filterQuery,
+        _quickFilter,
+        DnsResolutionCache.resolvedHosts,
+        _resolveHostnames
+    ) { query, quick, resolvedMap, resolveEnabled ->
+        DisplayFilterParser.parse(
+            query = query,
+            quickFilter = quick,
+            resolvedDomains = if (resolveEnabled) resolvedMap else emptyMap()
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = ParsedDisplayFilter(isValid = true) { true }
+    )
+
+    val filteredPackets: StateFlow<List<CapturedPacket>> = combine(
+        CaptureRepository.packets,
+        parsedFilterFlow
+    ) { packets, parsed ->
+        packets.filter(parsed.matches)
+    }.flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val uiState: StateFlow<CaptureUiState> = combine(
+        CaptureRepository.isCapturing,
+        CaptureRepository.captureStartTimeMs,
+        CaptureRepository.totalPacketCount,
+        CaptureRepository.totalBytes,
+        filteredPackets,
+        _filterQuery,
+        _quickFilter,
+        parsedFilterFlow,
+        _selectedPacketId,
+        _autoScroll,
+        CaptureRepository.throughputHistory,
+        _darkTheme,
+        _resolveHostnames,
+        DnsResolutionCache.resolvedHosts
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        CaptureUiState(
+            isCapturing = values[0] as Boolean,
+            captureStartTimeMs = values[1] as Long?,
+            totalPacketCount = values[2] as Long,
+            totalBytes = values[3] as Long,
+            packets = values[4] as List<CapturedPacket>,
+            filterQuery = values[5] as String,
+            quickFilter = values[6] as QuickFilter,
+            filterValidation = values[7] as ParsedDisplayFilter,
+            selectedPacketId = values[8] as Long?,
+            autoScroll = values[9] as Boolean,
+            throughputHistory = values[10] as List<ThroughputPoint>,
+            darkTheme = values[11] as Boolean,
+            resolveHostnames = values[12] as Boolean,
+            resolvedDomains = values[13] as Map<String, ResolvedHost>
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = CaptureUiState()
+    )
+
+    val selectedPacket: StateFlow<CapturedPacket?> = combine(
+        CaptureRepository.packets,
+        _selectedPacketId
+    ) { packets, selectedId ->
+        selectedId?.let { id -> packets.find { it.id == id } }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = null
+    )
+
+    val conversations: StateFlow<List<ConversationStream>> = combine(
+        CaptureRepository.packets,
+        DnsResolutionCache.resolvedHosts,
+        _resolveHostnames
+    ) { packets, resolvedMap, resolveEnabled ->
+        buildConversations(packets, if (resolveEnabled) resolvedMap else emptyMap())
+    }.flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val protocolStats: StateFlow<List<ProtocolStat>> = CaptureRepository.packets
+        .map { packets -> buildProtocolStats(packets) }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val topHosts: StateFlow<List<Pair<String, Int>>> = CaptureRepository.packets
+        .map { packets ->
+            packets.mapNotNull { it.hostOrSni?.takeIf { h -> h.isNotBlank() } }
+                .groupingBy { it }
+                .eachCount()
+                .entries
+                .sortedByDescending { it.value }
+                .take(10)
+                .map { it.key to it.value }
+        }.flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    fun setFilterQuery(query: String) {
+        _filterQuery.value = query
+    }
+
+    fun setQuickFilter(filter: QuickFilter) {
+        _quickFilter.value = filter
+    }
+
+    fun selectPacket(packetId: Long?) {
+        _selectedPacketId.value = packetId
+    }
+
+    fun toggleAutoScroll() {
+        _autoScroll.value = !_autoScroll.value
+    }
+
+    fun toggleTheme() {
+        _darkTheme.value = !_darkTheme.value
+    }
+
+    fun toggleResolveHostnames() {
+        val next = !_resolveHostnames.value
+        _resolveHostnames.value = next
+        DnsResolutionCache.setAutoPtrEnabled(next)
+        _toastEvent.value = if (next) {
+            "DNS IP-to-domain resolution enabled"
+        } else {
+            "Showing raw IP addresses"
+        }
+    }
+
+    fun filterToStream(stream: ConversationStream) {
+        _quickFilter.value = QuickFilter.ALL
+        val portPart = if (stream.remotePort > 0) " && port == ${stream.remotePort}" else ""
+        _filterQuery.value = "ip.addr == ${stream.remoteIp}$portPart"
+    }
+
+    fun clearCapture() {
+        _selectedPacketId.value = null
+        CaptureRepository.clearCapture()
+        _toastEvent.value = "Capture buffer cleared"
+    }
+
+    fun consumeToast() {
+        _toastEvent.value = null
+    }
+
+    fun packetsForStream(streamKey: String): List<CapturedPacket> =
+        CaptureRepository.snapshotAllPackets().filter { it.streamKey == streamKey }
+
+    fun exportPcap(
+        contentResolver: ContentResolver,
+        uri: Uri,
+        filteredOnly: Boolean = false
+    ) {
+        viewModelScope.launch {
+            val packets = if (filteredOnly) {
+                filteredPackets.value
+            } else {
+                CaptureRepository.snapshotAllPackets()
+            }
+            if (packets.isEmpty()) {
+                _toastEvent.value = "No packets to export"
+                return@launch
+            }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    contentResolver.openOutputStream(uri)?.use { out ->
+                        PcapCodec.writePcap(packets, out)
+                    } ?: error("Unable to open destination file")
+                }
+            }
+            _toastEvent.value = result.fold(
+                onSuccess = { "Saved ${packets.size} packets to .pcap (Wireshark-ready)" },
+                onFailure = { "Export failed: ${it.message}" }
+            )
+        }
+    }
+
+    fun exportPcapForSharing(
+        context: Context,
+        fileName: String,
+        filteredOnly: Boolean,
+        onReadyToShare: (Uri, Int) -> Unit
+    ) {
+        viewModelScope.launch {
+            val packets = if (filteredOnly) {
+                filteredPackets.value
+            } else {
+                CaptureRepository.snapshotAllPackets()
+            }
+            if (packets.isEmpty()) {
+                _toastEvent.value = "No packets to share"
+                return@launch
+            }
+            val safeName = fileName.trim()
+                .ifEmpty { "piraiba_capture.pcap" }
+                .let { if (it.endsWith(".pcap", ignoreCase = true)) it else "$it.pcap" }
+                .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val dir = File(context.cacheDir, "captures").apply { mkdirs() }
+                    val file = File(dir, safeName)
+                    FileOutputStream(file).use { out ->
+                        PcapCodec.writePcap(packets, out)
+                    }
+                    FileProvider.getUriForFile(
+                        context,
+                        "${context.packageName}.fileprovider",
+                        file
+                    )
+                }
+            }
+            result.fold(
+                onSuccess = { uri -> onReadyToShare(uri, packets.size) },
+                onFailure = { _toastEvent.value = "Share export failed: ${it.message}" }
+            )
+        }
+    }
+
+    fun importPcap(contentResolver: ContentResolver, uri: Uri) {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        PcapCodec.readPcap(input)
+                    } ?: error("Unable to open .pcap file")
+                }
+            }
+            result.fold(
+                onSuccess = { imported ->
+                    if (imported.isEmpty()) {
+                        _toastEvent.value = "No valid IP packets found in file"
+                    } else {
+                        _selectedPacketId.value = imported.firstOrNull()?.id
+                        CaptureRepository.replaceWithImportedPackets(imported)
+                        _toastEvent.value = "Loaded ${imported.size} packets from .pcap"
+                    }
+                },
+                onFailure = {
+                    _toastEvent.value = "Import failed: ${it.message}"
+                }
+            )
+        }
+    }
+
+    fun runProbe(type: ProbeType) {
+        if (_probeBusy.value) return
+        viewModelScope.launch {
+            _probeBusy.value = true
+            val result = CaptureRepository.sendDiagnosticProbe(type)
+            _probeBusy.value = false
+            _toastEvent.value = result.fold(
+                onSuccess = { it },
+                onFailure = { "Probe failed: ${it.message}" }
+            )
+        }
+    }
+
+    private fun buildConversations(
+        packets: List<CapturedPacket>,
+        resolvedDomains: Map<String, ResolvedHost>
+    ): List<ConversationStream> {
+        if (packets.isEmpty()) return emptyList()
+        val grouped = LinkedHashMap<String, MutableList<CapturedPacket>>()
+        for (pkt in packets) {
+            grouped.getOrPut(pkt.streamKey) { mutableListOf() }.add(pkt)
+        }
+        return grouped.entries.map { (key, list) ->
+            val first = list.first()
+            val last = list.last()
+            val isFirstOut = first.direction == PacketDirection.OUTBOUND
+            val localEp = if (isFirstOut) "${first.srcIp}:${first.srcPort}" else "${first.dstIp}:${first.dstPort}"
+            val remoteIp = if (isFirstOut) first.dstIp else first.srcIp
+            val remotePort = if (isFirstOut) first.dstPort else first.srcPort
+            val remoteEp = "$remoteIp:$remotePort"
+
+            val highestProto = list.firstOrNull {
+                it.protocol in setOf(ProtocolType.TLS, ProtocolType.HTTP, ProtocolType.DNS, ProtocolType.QUIC)
+            }?.protocol ?: first.protocol
+
+            val host = list.firstNotNullOfOrNull { it.hostOrSni } ?: resolvedDomains[remoteIp]?.domain
+            var outBytes = 0L
+            var inBytes = 0L
+            for (p in list) {
+                if (p.direction == PacketDirection.OUTBOUND) outBytes += p.length else inBytes += p.length
+            }
+
+            ConversationStream(
+                key = key,
+                localEndpoint = localEp,
+                remoteEndpoint = remoteEp,
+                remoteIp = remoteIp,
+                remotePort = remotePort,
+                protocol = highestProto,
+                transportProtocol = first.transportProtocol,
+                hostLabel = host,
+                packetCount = list.size,
+                bytesOut = outBytes,
+                bytesIn = inBytes,
+                firstSeenMs = first.timestampMs,
+                lastSeenMs = last.timestampMs
+            )
+        }.sortedByDescending { it.lastSeenMs }
+    }
+
+    private fun buildProtocolStats(packets: List<CapturedPacket>): List<ProtocolStat> {
+        if (packets.isEmpty()) return emptyList()
+        val total = packets.size.toFloat()
+        return packets.groupBy { it.protocol }
+            .entries
+            .map { (proto, list) ->
+                ProtocolStat(
+                    protocol = proto,
+                    packetCount = list.size,
+                    totalBytes = list.sumOf { it.length.toLong() },
+                    fraction = list.size / total
+                )
+            }
+            .sortedByDescending { it.packetCount }
+    }
+}

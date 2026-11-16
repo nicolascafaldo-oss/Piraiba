@@ -1,0 +1,6 @@
+{
+  "name": "Piraíba",
+  "description": "Real-time Android network packet capture, protocol dissector, and PCAP analyzer powered by local VpnService.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
