@@ -3,6 +3,6 @@
     <item
         android:width="66dp"
         android:height="66dp"
-        android:drawable="@drawable/ic_piraiba_logo_1794855477564"
+        android:drawable="@drawable/ic_piraiba_warm_1794860348758"
         android:gravity="center" />
 </layer-list>

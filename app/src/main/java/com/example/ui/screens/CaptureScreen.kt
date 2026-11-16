@@ -25,6 +25,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.HelpOutline
 import androidx.compose.material.icons.rounded.Bolt
@@ -68,6 +69,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
@@ -703,7 +705,9 @@ private fun EmptyCaptureView(
     modifier: Modifier = Modifier
 ) {
     Box(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
         contentAlignment = Alignment.Center
     ) {
         Surface(
@@ -712,12 +716,12 @@ private fun EmptyCaptureView(
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 12.dp)
+                .padding(vertical = 8.dp)
         ) {
             Column(
-                modifier = Modifier.padding(18.dp),
+                modifier = Modifier.padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 if (hasActiveFilter && totalCaptured > 0) {
                     Icon(
@@ -728,12 +732,14 @@ private fun EmptyCaptureView(
                     )
                     Text(
                         text = "No Packets Match Display Filter",
-                        style = MaterialTheme.typography.titleMedium
+                        style = MaterialTheme.typography.titleMedium,
+                        textAlign = TextAlign.Center
                     )
                     Text(
                         text = "$totalCaptured packets captured in buffer, hidden by the active filter.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f),
+                        textAlign = TextAlign.Center
                     )
                     Button(onClick = onResetFilters) {
                         Text("Reset Display Filters")
@@ -745,13 +751,15 @@ private fun EmptyCaptureView(
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(172.dp)
+                            .height(136.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(ConsoleBgDark)
                     )
                     Text(
                         text = if (isCapturing) "Listening on tun0 (10.1.10.1)..." else stringResource(R.string.empty_capture_title),
-                        style = MaterialTheme.typography.titleLarge
+                        style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = TextAlign.Center
                     )
                     Text(
                         text = if (isCapturing) {
@@ -759,8 +767,9 @@ private fun EmptyCaptureView(
                         } else {
                             stringResource(R.string.empty_capture_subtitle)
                         },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.90f),
+                        textAlign = TextAlign.Center
                     )
                     if (!isCapturing) {
                         Row(

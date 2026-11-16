@@ -27,6 +27,12 @@ import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
+data class CaptureStatusEvent(
+    val id: Long,
+    val message: String,
+    val isError: Boolean = false
+)
+
 /**
  * Thread-safe singleton repository holding live captured packets, throughput telemetry,
  * and VPN capture state shared between PacketCaptureVpnService and the Compose UI.
@@ -69,8 +75,9 @@ object CaptureRepository {
     private val _throughputHistory = MutableStateFlow<List<ThroughputPoint>>(emptyList())
     val throughputHistory: StateFlow<List<ThroughputPoint>> = _throughputHistory.asStateFlow()
 
-    private val _statusMessage = MutableStateFlow<String?>(null)
-    val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
+    private val statusSeq = AtomicLong(0L)
+    private val _statusMessage = MutableStateFlow<CaptureStatusEvent?>(null)
+    val statusMessage: StateFlow<CaptureStatusEvent?> = _statusMessage.asStateFlow()
 
     init {
         scope.launch {
@@ -91,15 +98,25 @@ object CaptureRepository {
             _captureStartTimeMs.value = now
         }
         _isCapturing.value = true
-        _statusMessage.value = "Local VPN tunnel active on tun0 (10.1.10.1)"
+        _statusMessage.value = CaptureStatusEvent(
+            id = statusSeq.incrementAndGet(),
+            message = "Local VPN tunnel active on tun0 (10.1.10.1)",
+            isError = false
+        )
     }
 
-    fun onCaptureStopped(reason: String? = null) {
+    fun onCaptureStopped(reason: String? = null, isError: Boolean = false) {
         _isCapturing.value = false
         if (dirty.compareAndSet(true, false)) {
             flushToStateFlows()
         }
-        _statusMessage.value = reason
+        if (reason != null) {
+            _statusMessage.value = CaptureStatusEvent(
+                id = statusSeq.incrementAndGet(),
+                message = reason,
+                isError = isError
+            )
+        }
     }
 
     fun clearStatusMessage() {

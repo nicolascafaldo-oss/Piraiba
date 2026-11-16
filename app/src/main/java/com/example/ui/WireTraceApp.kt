@@ -2,15 +2,19 @@ package com.example.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -33,6 +37,7 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Radar
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
@@ -52,6 +57,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.VerticalDivider
@@ -68,6 +74,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -128,6 +135,8 @@ fun WireTraceApp(
     var showExportDialog by remember { mutableStateOf(false) }
     var pendingExportFilteredOnly by remember { mutableStateOf(false) }
     var followStreamKey by remember { mutableStateOf<String?>(null) }
+    var vpnIssueDialogMessage by remember { mutableStateOf<String?>(null) }
+    var askedNotificationThisSession by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         viewModel.bindAlertStore(context)
@@ -140,10 +149,13 @@ fun WireTraceApp(
         }
     }
 
-    LaunchedEffect(vpnStatus) {
-        vpnStatus?.let { msg ->
-            snackbarHostState.showSnackbar(msg)
-            CaptureRepository.clearStatusMessage()
+    LaunchedEffect(vpnStatus?.id) {
+        val status = vpnStatus ?: return@LaunchedEffect
+        CaptureRepository.clearStatusMessage()
+        if (status.isError) {
+            vpnIssueDialogMessage = status.message
+        } else {
+            snackbarHostState.showSnackbar(status.message)
         }
     }
 
@@ -166,18 +178,42 @@ fun WireTraceApp(
         }
     }
 
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        // Non-blocking: VPN capture continues regardless of notification preference.
+    }
+
     fun startVpnService() {
-        val intent = Intent(context, PacketCaptureVpnService::class.java).apply {
-            action = PacketCaptureVpnService.ACTION_START
+        try {
+            val intent = Intent(context, PacketCaptureVpnService::class.java).apply {
+                action = PacketCaptureVpnService.ACTION_START
+            }
+            ContextCompat.startForegroundService(context, intent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !askedNotificationThisSession) {
+                val granted = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!granted) {
+                    askedNotificationThisSession = true
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+        } catch (e: Exception) {
+            vpnIssueDialogMessage = "Could not start the local capture service: ${e.message ?: "unknown error"}."
         }
-        ContextCompat.startForegroundService(context, intent)
     }
 
     fun stopVpnService() {
-        val intent = Intent(context, PacketCaptureVpnService::class.java).apply {
-            action = PacketCaptureVpnService.ACTION_STOP
+        try {
+            val intent = Intent(context, PacketCaptureVpnService::class.java).apply {
+                action = PacketCaptureVpnService.ACTION_STOP
+            }
+            context.startService(intent)
+        } catch (_: Exception) {
+            CaptureRepository.onCaptureStopped("Capture stopped")
         }
-        context.startService(intent)
     }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
@@ -186,23 +222,8 @@ fun WireTraceApp(
         if (result.resultCode == Activity.RESULT_OK) {
             startVpnService()
         } else {
-            CaptureRepository.onCaptureStopped("VPN consent is required to capture local packets")
+            vpnIssueDialogMessage = "VPN access is required to capture traffic on-device without root. If the Android VPN prompt didn't appear or couldn't be accepted, check Settings → Network & internet → VPN to make sure no other VPN or Always-on VPN is locking the connection."
         }
-    }
-
-    fun proceedWithVpnConsent() {
-        val prepareIntent = VpnService.prepare(context)
-        if (prepareIntent != null) {
-            vpnPermissionLauncher.launch(prepareIntent)
-        } else {
-            startVpnService()
-        }
-    }
-
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        proceedWithVpnConsent()
     }
 
     val alertNotificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -212,17 +233,22 @@ fun WireTraceApp(
     }
 
     fun requestStartCapture() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val granted = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-            if (!granted) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                return
-            }
+        val hostContext = context.findActivity() ?: context
+        val prepareIntent = try {
+            VpnService.prepare(hostContext)
+        } catch (e: Exception) {
+            vpnIssueDialogMessage = "Android blocked the VPN permission check (${e.message ?: "restricted"}). If another VPN or Always-on VPN is active, disable it in Settings → Network & internet → VPN and retry."
+            return
         }
-        proceedWithVpnConsent()
+        if (prepareIntent != null) {
+            try {
+                vpnPermissionLauncher.launch(prepareIntent)
+            } catch (e: Exception) {
+                vpnIssueDialogMessage = "Unable to launch the Android VPN consent dialog (${e.message ?: "unavailable"}). Open VPN Settings to check active VPN apps."
+            }
+        } else {
+            startVpnService()
+        }
     }
 
     val exportPcapLauncher = rememberLauncherForActivityResult(
@@ -248,6 +274,50 @@ fun WireTraceApp(
     }
 
     WireTraceTheme(darkTheme = uiState.darkTheme) {
+        if (vpnIssueDialogMessage != null) {
+            AlertDialog(
+                onDismissRequest = { vpnIssueDialogMessage = null },
+                title = {
+                    Text(
+                        text = "VPN Permission Needed",
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                },
+                text = {
+                    Text(
+                        text = vpnIssueDialogMessage.orEmpty(),
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            vpnIssueDialogMessage = null
+                            requestStartCapture()
+                        }
+                    ) {
+                        Text("Retry Prompt")
+                    }
+                },
+                dismissButton = {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = {
+                                vpnIssueDialogMessage = null
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                                }
+                            }
+                        ) {
+                            Text("VPN Settings")
+                        }
+                        TextButton(onClick = { vpnIssueDialogMessage = null }) {
+                            Text("Close")
+                        }
+                    }
+                }
+            )
+        }
         if (showExportDialog) {
             ExportPcapDialog(
                 totalCount = CaptureRepository.snapshotAllPackets().size,
@@ -322,11 +392,13 @@ fun WireTraceApp(
                         title = {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text(
                                     text = stringResource(R.string.app_name),
-                                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
+                                    style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                                 LiveCaptureIndicator(isCapturing = uiState.isCapturing)
                             }
@@ -336,12 +408,13 @@ fun WireTraceApp(
                                 onClick = {
                                     if (uiState.isCapturing) stopVpnService() else requestStartCapture()
                                 },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = if (uiState.isCapturing) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                                     contentColor = if (uiState.isCapturing) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
                                 ),
                                 modifier = Modifier
-                                    .padding(end = 4.dp)
+                                    .padding(end = 2.dp)
                                     .testTag("start_stop_capture_button")
                             ) {
                                 Icon(
@@ -355,7 +428,8 @@ fun WireTraceApp(
                                         stringResource(R.string.action_stop_capture)
                                     } else {
                                         stringResource(R.string.action_start_capture)
-                                    }
+                                    },
+                                    maxLines = 1
                                 )
                             }
 
@@ -655,4 +729,10 @@ fun WireTraceApp(
             }
         }
     }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }

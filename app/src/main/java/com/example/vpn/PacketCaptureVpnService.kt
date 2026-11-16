@@ -167,8 +167,18 @@ class PacketCaptureVpnService : VpnService() {
 
     private fun startTunnelAndLoops() {
         try {
+            val configureIntent = PendingIntent.getActivity(
+                this,
+                2,
+                Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                },
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
             val pfd = Builder()
                 .setSession("Piraíba Capture")
+                .setConfigureIntent(configureIntent)
                 .setMtu(MTU_SIZE)
                 .addAddress(LOCAL_TUN_IP, 32)
                 .addRoute("0.0.0.0", 0)
@@ -178,7 +188,10 @@ class PacketCaptureVpnService : VpnService() {
 
             if (pfd == null) {
                 running.set(false)
-                CaptureRepository.onCaptureStopped("Unable to establish local VPN interface")
+                CaptureRepository.onCaptureStopped(
+                    reason = "Android could not create the local VPN interface. Another VPN or Always-on VPN may currently be active in device settings.",
+                    isError = true
+                )
                 stopSelf()
                 return
             }
@@ -193,7 +206,10 @@ class PacketCaptureVpnService : VpnService() {
             tunReaderThread = Thread(::runTunReaderLoop, "WireTrace-TunReader").apply { start() }
         } catch (e: Exception) {
             running.set(false)
-            CaptureRepository.onCaptureStopped("Capture start failed: ${e.message}")
+            CaptureRepository.onCaptureStopped(
+                reason = "Capture start failed: ${e.message ?: "unexpected error"}",
+                isError = true
+            )
             stopSelf()
         }
     }
