@@ -200,6 +200,7 @@ class PacketCaptureVpnService : VpnService() {
             tunOutputStream = FileOutputStream(pfd.fileDescriptor)
             selector = Selector.open()
             DnsResolutionCache.setSocketProtector { socket -> protect(socket) }
+            CaptureRepository.setVpnSocketProtector(this) { socket -> protect(socket) }
             CaptureRepository.onCaptureStarted()
 
             selectorThread = Thread(::runSelectorLoop, "WireTrace-Selector").apply { start() }
@@ -235,6 +236,7 @@ class PacketCaptureVpnService : VpnService() {
         selectorThread = null
 
         DnsResolutionCache.setSocketProtector(null)
+        CaptureRepository.setVpnSocketProtector(this, null)
         CaptureRepository.onCaptureStopped(reason)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)

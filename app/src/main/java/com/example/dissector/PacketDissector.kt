@@ -1,5 +1,6 @@
 package com.example.dissector
 
+import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.DnsMapping
 import com.example.model.LinkLayerType
@@ -31,12 +32,17 @@ object PacketDissector {
         timestampMs: Long,
         relativeTimeMs: Long,
         direction: PacketDirection,
-        linkLayerType: LinkLayerType = LinkLayerType.RAW_TUN
+        linkLayerType: LinkLayerType = LinkLayerType.RAW_TUN,
+        captureSource: CaptureSource = CaptureSource.DEVICE_VPN
     ): CapturedPacket {
         val len = rawBytes.size
         val layers = mutableListOf<ProtocolLayer>()
 
-        val interfaceLabel = if (linkLayerType == LinkLayerType.ETHERNET) "eth0 (Ethernet II)" else "tun0 (Raw IP)"
+        val interfaceLabel = when {
+            captureSource == CaptureSource.LAN_PROMISCUOUS -> "wlan0 (Promiscuous LAN Multicast)"
+            linkLayerType == LinkLayerType.ETHERNET -> "eth0 (Ethernet II)"
+            else -> "tun0 (Raw IP)"
+        }
         layers.add(
             ProtocolLayer(
                 name = "Frame #$id: $len bytes on $interfaceLabel (${direction.shortLabel})",
@@ -45,6 +51,7 @@ object PacketDissector {
                 fields = listOf(
                     ProtocolField("Frame Number", "$id", 0, len),
                     ProtocolField("Capture Length", "$len bytes ($len * 8 = ${len * 8} bits)", 0, len),
+                    ProtocolField("Capture Source", captureSource.label, 0, len),
                     ProtocolField("Interface", interfaceLabel, 0, len),
                     ProtocolField(
                         "Direction",
@@ -61,6 +68,7 @@ object PacketDissector {
         if (linkLayerType == LinkLayerType.ETHERNET) {
             if (len < 14) {
                 return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Truncated Ethernet frame")
+                    .copy(captureSource = captureSource)
             }
             val dstMac = macString(rawBytes, 0)
             val srcMac = macString(rawBytes, 6)
@@ -86,7 +94,20 @@ object PacketDissector {
             l3Offset = 14
             if (etherType != 0x0800 && etherType != 0x86DD) {
                 return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Ethernet $etherTypeLabel")
+                    .copy(captureSource = captureSource)
             }
+        } else if (captureSource == CaptureSource.LAN_PROMISCUOUS) {
+            layers.add(
+                ProtocolLayer(
+                    name = "Link Layer: Wi-Fi LAN Promiscuous Multicast (wlan0)",
+                    byteStart = 0,
+                    byteEnd = 0,
+                    fields = listOf(
+                        ProtocolField("Capture Mode", "WifiManager.MulticastLock (mDNS / SSDP)", 0, 0),
+                        ProtocolField("Scope", "Local Wi-Fi Broadcast / Multicast Domain", 0, 0)
+                    )
+                )
+            )
         } else {
             layers.add(
                 ProtocolLayer(
@@ -103,14 +124,16 @@ object PacketDissector {
 
         if (l3Offset >= len) {
             return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Truncated frame")
+                .copy(captureSource = captureSource)
         }
 
         val ipVersion = (rawBytes[l3Offset].toInt() ushr 4) and 0x0F
-        return when (ipVersion) {
+        val parsed = when (ipVersion) {
             4 -> dissectIpv4(id, rawBytes, l3Offset, timestampMs, relativeTimeMs, direction, linkLayerType, layers)
             6 -> dissectIpv6(id, rawBytes, l3Offset, timestampMs, relativeTimeMs, direction, linkLayerType, layers)
             else -> fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Unknown L3 version ($ipVersion)")
         }
+        return parsed.copy(captureSource = captureSource)
     }
 
     private fun dissectIpv4(

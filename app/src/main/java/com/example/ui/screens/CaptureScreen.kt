@@ -8,6 +8,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,11 +35,15 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.FolderOpen
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Layers
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.VerticalAlignBottom
 import androidx.compose.material.icons.rounded.WarningAmber
+import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -73,10 +79,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.ProbeType
 import com.example.model.QuickFilter
 import com.example.model.ResolvedHost
+import com.example.model.TrafficScopeFilter
+import com.example.ui.components.CaptureSourceBadge
 import com.example.ui.components.DirectionPill
 import com.example.ui.components.FilterHelpDialog
 import com.example.ui.components.MiniThroughputSparkline
@@ -98,13 +107,16 @@ fun CaptureScreen(
     onRunProbe: (ProbeType) -> Unit,
     onFilterQueryChange: (String) -> Unit,
     onQuickFilterSelected: (QuickFilter) -> Unit,
+    onTrafficScopeSelected: (TrafficScopeFilter) -> Unit,
     onToggleAutoScroll: () -> Unit,
     onToggleResolveHostnames: () -> Unit,
+    onToggleLanMulticast: () -> Unit,
     onSelectPacket: (CapturedPacket) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var showFilterHelp by remember { mutableStateOf(false) }
     var showFilterBuilder by remember { mutableStateOf(false) }
+    var showPromiscuousInfo by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
 
@@ -130,6 +142,40 @@ fun CaptureScreen(
                 showFilterBuilder = false
             },
             onDismiss = { showFilterBuilder = false }
+        )
+    }
+
+    if (showPromiscuousInfo) {
+        AlertDialog(
+            onDismissRequest = { showPromiscuousInfo = false },
+            title = {
+                Text(
+                    text = "All-Local & LAN Multicast Mode",
+                    style = MaterialTheme.typography.titleLarge
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "• Device-Wide Capture (tun0): Routes and dissects all IPv4 app traffic on this phone, including private LAN connections (192.168.x.x / 10.x.x.x).",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        text = "• LAN Multicast Listen (MulticastLock): Joins Wi-Fi mDNS (224.0.0.251:5353) and SSDP/UPnP (239.255.255.250:1900) to capture real local discovery broadcasts from nearby printers, routers, TVs, and computers.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        text = "• Android OS Boundary: Standard non-rooted Android kernels block raw wlan0 hardware promiscuous sniffing (AF_PACKET / CAP_NET_RAW), so private unicast frames between other devices on your Wi-Fi cannot be intercepted without root.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showPromiscuousInfo = false }) {
+                    Text("Got it")
+                }
+            }
         )
     }
 
@@ -269,16 +315,40 @@ fun CaptureScreen(
             }
         }
 
+        LanMulticastStrip(
+            enabled = uiState.lanMulticastEnabled,
+            active = uiState.lanMulticastActive,
+            lanPacketCount = uiState.lanPacketCount,
+            onToggle = onToggleLanMulticast,
+            onShowInfo = { showPromiscuousInfo = true }
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        TrafficScopeSelectorBar(
+            selectedScope = uiState.trafficScopeFilter,
+            phoneCount = uiState.phonePacketCount,
+            lanCount = uiState.lanBufferedPacketCount,
+            onSelectScope = onTrafficScopeSelected
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
         if (uiState.packets.isEmpty()) {
             EmptyCaptureView(
                 isCapturing = uiState.isCapturing,
                 hasActiveFilter = hasQuery || uiState.quickFilter != QuickFilter.ALL,
+                trafficScopeFilter = uiState.trafficScopeFilter,
+                phonePacketCount = uiState.phonePacketCount,
+                lanBufferedPacketCount = uiState.lanBufferedPacketCount,
                 totalCaptured = uiState.totalPacketCount,
                 probeBusy = probeBusy,
                 onStartCapture = onStartCapture,
                 onOpenPcap = onOpenPcap,
                 onRunProbe = onRunProbe,
+                onResetScope = { onTrafficScopeSelected(TrafficScopeFilter.ALL) },
                 onResetFilters = {
+                    onTrafficScopeSelected(TrafficScopeFilter.ALL)
                     onFilterQueryChange("")
                     onQuickFilterSelected(QuickFilter.ALL)
                 },
@@ -548,6 +618,7 @@ private fun TelemetrySummaryStrip(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun PacketRowCard(
     packet: CapturedPacket,
@@ -557,15 +628,17 @@ private fun PacketRowCard(
     onClick: () -> Unit
 ) {
     val protoColor = LocalProtocolColors.current.colorFor(packet.protocol)
-    val bgColor = if (isSelected) {
-        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.38f)
-    } else {
-        MaterialTheme.colorScheme.surfaceContainerLow
+    val isLanPacket = packet.captureSource == CaptureSource.LAN_PROMISCUOUS
+    val stripeColor = if (isLanPacket) WarmGoldLive else protoColor
+    val bgColor = when {
+        isSelected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.38f)
+        isLanPacket -> WarmGoldLive.copy(alpha = 0.06f)
+        else -> MaterialTheme.colorScheme.surfaceContainerLow
     }
-    val borderColor = if (isSelected) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
+    val borderColor = when {
+        isSelected -> MaterialTheme.colorScheme.primary
+        isLanPacket -> WarmGoldLive.copy(alpha = 0.45f)
+        else -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
     }
 
     Surface(
@@ -584,7 +657,7 @@ private fun PacketRowCard(
                 modifier = Modifier
                     .width(4.dp)
                     .heightIn(min = 68.dp)
-                    .background(protoColor)
+                    .background(stripeColor)
             )
 
             Column(
@@ -598,9 +671,10 @@ private fun PacketRowCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    FlowRow(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         Text(
                             text = "#${packet.id}",
@@ -608,17 +682,30 @@ private fun PacketRowCard(
                                 fontFamily = MonoFontFamily,
                                 fontWeight = FontWeight.Bold
                             ),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.align(Alignment.CenterVertically)
                         )
                         Text(
                             text = String.format("%.3fs", packet.relativeTimeMs / 1000.0),
                             style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.align(Alignment.CenterVertically)
                         )
-                        ProtocolBadge(protocol = packet.protocol)
-                        DirectionPill(direction = packet.direction)
+                        ProtocolBadge(
+                            protocol = packet.protocol,
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
+                        CaptureSourceBadge(
+                            captureSource = packet.captureSource,
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
+                        DirectionPill(
+                            direction = packet.direction,
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
                     }
 
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = "${packet.length} B",
                         style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
@@ -696,11 +783,15 @@ private fun PacketRowCard(
 private fun EmptyCaptureView(
     isCapturing: Boolean,
     hasActiveFilter: Boolean,
+    trafficScopeFilter: TrafficScopeFilter,
+    phonePacketCount: Int,
+    lanBufferedPacketCount: Int,
     totalCaptured: Long,
     probeBusy: Boolean,
     onStartCapture: () -> Unit,
     onOpenPcap: () -> Unit,
     onRunProbe: (ProbeType) -> Unit,
+    onResetScope: () -> Unit,
     onResetFilters: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -723,7 +814,89 @@ private fun EmptyCaptureView(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                if (hasActiveFilter && totalCaptured > 0) {
+                val emptyByLanScope = trafficScopeFilter == TrafficScopeFilter.LAN_ONLY &&
+                    lanBufferedPacketCount == 0 && !hasActiveFilter
+                val emptyByPhoneScope = trafficScopeFilter == TrafficScopeFilter.PHONE_ONLY &&
+                    phonePacketCount == 0 && !hasActiveFilter
+
+                if (emptyByLanScope) {
+                    Icon(
+                        imageVector = Icons.Rounded.WifiTethering,
+                        contentDescription = null,
+                        tint = WarmGoldLive,
+                        modifier = Modifier.size(44.dp)
+                    )
+                    Text(
+                        text = "No LAN Promiscuous Packets Yet",
+                        style = MaterialTheme.typography.titleMedium,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "This lane isolates Wi-Fi LAN multicast discovery traffic (mDNS & SSDP on wlan0) cleanly from your phone's tun0 traffic ($phonePacketCount phone packets buffered).",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f),
+                        textAlign = TextAlign.Center
+                    )
+                    OutlinedButton(
+                        onClick = { onRunProbe(ProbeType.LAN_DISCOVERY) },
+                        enabled = !probeBusy,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("empty_scope_probe_lan_button")
+                    ) {
+                        Icon(Icons.Rounded.WifiTethering, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Send LAN Multicast Sweep")
+                    }
+                    Button(
+                        onClick = onResetScope,
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
+                        Text("Show All Traffic")
+                    }
+                } else if (emptyByPhoneScope && lanBufferedPacketCount > 0) {
+                    Icon(
+                        imageVector = Icons.Rounded.Smartphone,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(44.dp)
+                    )
+                    Text(
+                        text = "No Phone (tun0) Packets Yet",
+                        style = MaterialTheme.typography.titleMedium,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "$lanBufferedPacketCount LAN promiscuous packets are buffered in the LAN tab. Start VPN Capture on tun0 to inspect device app traffic here.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f),
+                        textAlign = TextAlign.Center
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (!isCapturing) {
+                            Button(
+                                onClick = onStartCapture,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                            ) {
+                                Text("Start Capture")
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = onResetScope,
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                        ) {
+                            Text("Show All Traffic")
+                        }
+                    }
+                } else if (hasActiveFilter && totalCaptured > 0) {
                     Icon(
                         imageVector = Icons.Rounded.Search,
                         contentDescription = null,
@@ -741,7 +914,10 @@ private fun EmptyCaptureView(
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f),
                         textAlign = TextAlign.Center
                     )
-                    Button(onClick = onResetFilters) {
+                    Button(
+                        onClick = onResetFilters,
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
                         Text("Reset Display Filters")
                     }
                 } else {
@@ -751,7 +927,7 @@ private fun EmptyCaptureView(
                         contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(136.dp)
+                            .height(124.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(ConsoleBgDark)
                     )
@@ -837,9 +1013,180 @@ private fun EmptyCaptureView(
                                 Text("TLS Probe")
                             }
                         }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        OutlinedButton(
+                            onClick = { onRunProbe(ProbeType.LAN_DISCOVERY) },
+                            enabled = !probeBusy,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .testTag("probe_lan_button")
+                        ) {
+                            Icon(Icons.Rounded.WifiTethering, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("Send LAN Multicast Sweep (mDNS + SSDP)")
+                        }
                     }
                 }
             }
         }
     }
 }
+
+@Composable
+private fun LanMulticastStrip(
+    enabled: Boolean,
+    active: Boolean,
+    lanPacketCount: Long,
+    onToggle: () -> Unit,
+    onShowInfo: () -> Unit
+) {
+    val activeAccent = if (active) WarmGoldLive else MaterialTheme.colorScheme.primary
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = if (enabled) {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerLow
+        },
+        border = BorderStroke(
+            1.dp,
+            if (enabled) activeAccent.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outlineVariant
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 10.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 48.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onToggle)
+                    .padding(horizontal = 4.dp)
+                    .testTag("lan_multicast_toggle")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.WifiTethering,
+                    contentDescription = "Toggle LAN Multicast promiscuous listener",
+                    tint = if (enabled) activeAccent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (enabled) {
+                            "Promiscuous LAN Listen: ON ($lanPacketCount LAN pkts)"
+                        } else {
+                            "Promiscuous LAN Listen (mDNS + SSDP)"
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (enabled) activeAccent else MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (active) {
+                            "WifiManager.MulticastLock active on 224.0.0.251 & 239.255.255.250"
+                        } else {
+                            "Tap to listen to local Wi-Fi mDNS & SSDP broadcasts"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            IconButton(
+                onClick = onShowInfo,
+                modifier = Modifier.testTag("promiscuous_info_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Info,
+                    contentDescription = "About Promiscuous Mode on Android",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TrafficScopeSelectorBar(
+    selectedScope: TrafficScopeFilter,
+    phoneCount: Int,
+    lanCount: Int,
+    onSelectScope: (TrafficScopeFilter) -> Unit
+) {
+    val totalCount = phoneCount + lanCount
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        TrafficScopeFilter.entries.forEach { scope ->
+            val selected = selectedScope == scope
+            val count = when (scope) {
+                TrafficScopeFilter.ALL -> totalCount
+                TrafficScopeFilter.PHONE_ONLY -> phoneCount
+                TrafficScopeFilter.LAN_ONLY -> lanCount
+            }
+            val isLanScope = scope == TrafficScopeFilter.LAN_ONLY
+            FilterChip(
+                selected = selected,
+                onClick = { onSelectScope(scope) },
+                leadingIcon = {
+                    Icon(
+                        imageVector = when (scope) {
+                            TrafficScopeFilter.ALL -> Icons.Rounded.Layers
+                            TrafficScopeFilter.PHONE_ONLY -> Icons.Rounded.Smartphone
+                            TrafficScopeFilter.LAN_ONLY -> Icons.Rounded.WifiTethering
+                        },
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                },
+                label = {
+                    Text(
+                        text = "${scope.label} ($count)",
+                        style = MaterialTheme.typography.labelMedium.copy(
+                            fontFamily = MonoFontFamily,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = if (isLanScope) {
+                        WarmGoldLive.copy(alpha = 0.22f)
+                    } else {
+                        MaterialTheme.colorScheme.primaryContainer
+                    },
+                    selectedLabelColor = if (isLanScope) {
+                        WarmGoldLive
+                    } else {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    },
+                    selectedLeadingIconColor = if (isLanScope) {
+                        WarmGoldLive
+                    } else {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    }
+                ),
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 48.dp)
+                    .testTag("scope_filter_${scope.name.lowercase()}")
+            )
+        }
+    }
+}
+

@@ -1,6 +1,8 @@
 package com.example.capture
 
+import android.content.Context
 import com.example.dissector.PacketDissector
+import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.PacketDirection
 import com.example.model.ProbeType
@@ -79,6 +81,12 @@ object CaptureRepository {
     private val _statusMessage = MutableStateFlow<CaptureStatusEvent?>(null)
     val statusMessage: StateFlow<CaptureStatusEvent?> = _statusMessage.asStateFlow()
 
+    private val _lanMulticastEnabled = MutableStateFlow(false)
+    val lanMulticastEnabled: StateFlow<Boolean> = _lanMulticastEnabled.asStateFlow()
+
+    @Volatile
+    private var vpnSocketProtector: ((DatagramSocket) -> Boolean)? = null
+
     init {
         scope.launch {
             while (isActive) {
@@ -89,6 +97,28 @@ object CaptureRepository {
                 }
                 delay(120L)
             }
+        }
+    }
+
+    fun setVpnSocketProtector(context: Context, protector: ((DatagramSocket) -> Boolean)?) {
+        vpnSocketProtector = protector
+        if (_lanMulticastEnabled.value) {
+            LanMulticastSniffer.restartIfRunning(context, protector)
+            if (protector != null && !LanMulticastSniffer.isListening.value) {
+                LanMulticastSniffer.start(context, protector)
+            }
+        }
+    }
+
+    fun setLanMulticastEnabled(context: Context, enabled: Boolean) {
+        _lanMulticastEnabled.value = enabled
+        if (enabled) {
+            LanMulticastSniffer.start(context, vpnSocketProtector)
+            scope.launch(Dispatchers.IO) {
+                runCatching { LanMulticastSniffer.sendDiscoverySweep(vpnSocketProtector) }
+            }
+        } else {
+            LanMulticastSniffer.stop(resetCount = false)
         }
     }
 
@@ -123,7 +153,11 @@ object CaptureRepository {
         _statusMessage.value = null
     }
 
-    fun recordRawPacket(rawBytes: ByteArray, direction: PacketDirection) {
+    fun recordRawPacket(
+        rawBytes: ByteArray,
+        direction: PacketDirection,
+        captureSource: CaptureSource = CaptureSource.DEVICE_VPN
+    ) {
         if (rawBytes.isEmpty()) return
         val now = System.currentTimeMillis()
         val start = _captureStartTimeMs.value ?: now.also { _captureStartTimeMs.value = it }
@@ -135,7 +169,8 @@ object CaptureRepository {
             rawBytes = rawBytes,
             timestampMs = now,
             relativeTimeMs = relMs,
-            direction = direction
+            direction = direction,
+            captureSource = captureSource
         )
 
         synchronized(bufferLock) {
@@ -208,6 +243,7 @@ object CaptureRepository {
         dirty.set(false)
         DnsResolutionCache.clear()
         AlertMonitor.clearAlerts()
+        LanMulticastSniffer.resetCounter()
     }
 
     fun snapshotAllPackets(): List<CapturedPacket> = synchronized(bufferLock) {
@@ -281,6 +317,9 @@ object CaptureRepository {
                         val session = sslSocket.session
                         "TLS handshake succeeded: ${session.protocol} (${session.cipherSuite})"
                     }
+                }
+                ProbeType.LAN_DISCOVERY -> {
+                    LanMulticastSniffer.sendDiscoverySweep(vpnSocketProtector)
                 }
             }
         }

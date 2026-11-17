@@ -611,8 +611,10 @@ fun WireTraceApp(
                                         onRunProbe = viewModel::runProbe,
                                         onFilterQueryChange = viewModel::setFilterQuery,
                                         onQuickFilterSelected = viewModel::setQuickFilter,
+                                        onTrafficScopeSelected = viewModel::setTrafficScopeFilter,
                                         onToggleAutoScroll = viewModel::toggleAutoScroll,
                                         onToggleResolveHostnames = viewModel::toggleResolveHostnames,
+                                        onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
                                         onSelectPacket = { pkt -> viewModel.selectPacket(pkt.id) },
                                         modifier = Modifier.weight(0.52f)
                                     )
@@ -639,8 +641,10 @@ fun WireTraceApp(
                                     onRunProbe = viewModel::runProbe,
                                     onFilterQueryChange = viewModel::setFilterQuery,
                                     onQuickFilterSelected = viewModel::setQuickFilter,
+                                    onTrafficScopeSelected = viewModel::setTrafficScopeFilter,
                                     onToggleAutoScroll = viewModel::toggleAutoScroll,
                                     onToggleResolveHostnames = viewModel::toggleResolveHostnames,
+                                    onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
                                     onSelectPacket = { pkt ->
                                         viewModel.selectPacket(pkt.id)
                                         navController.navigate(WireTraceRoutes.INSPECTOR)

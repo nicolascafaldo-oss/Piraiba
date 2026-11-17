@@ -52,6 +52,7 @@ import com.example.model.ProbeType
 import com.example.model.ProtocolStat
 import com.example.model.ResolvedHost
 import com.example.model.ThroughputPoint
+import com.example.ui.components.CaptureSourceBadge
 import com.example.ui.components.ProtocolBadge
 import com.example.ui.components.formatByteCount
 import com.example.ui.theme.LocalProtocolColors
@@ -83,7 +84,8 @@ fun AnalyticsScreen(
             ThroughputChartCard(
                 points = uiState.throughputHistory,
                 isCapturing = uiState.isCapturing,
-                totalPackets = uiState.totalPacketCount,
+                phonePackets = uiState.phonePacketCount,
+                lanPackets = uiState.lanBufferedPacketCount,
                 totalBytes = uiState.totalBytes
             )
         }
@@ -127,7 +129,8 @@ fun AnalyticsScreen(
 private fun ThroughputChartCard(
     points: List<ThroughputPoint>,
     isCapturing: Boolean,
-    totalPackets: Long,
+    phonePackets: Int,
+    lanPackets: Int,
     totalBytes: Long
 ) {
     val protoColors = LocalProtocolColors.current
@@ -165,7 +168,7 @@ private fun ThroughputChartCard(
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = "$totalPackets frames • ${formatByteCount(totalBytes)} captured",
+                            text = "$phonePackets Phone • $lanPackets LAN • ${formatByteCount(totalBytes)}",
                             style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -400,10 +403,11 @@ private fun ActiveConnectionsCard(
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
                             modifier = Modifier.weight(1f)
                         ) {
                             ProtocolBadge(protocol = conn.protocol)
+                            CaptureSourceBadge(captureSource = conn.captureSource)
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = conn.hostLabel ?: conn.remoteEndpoint,
@@ -681,6 +685,15 @@ private fun DiagnosticProbesCard(
                 ) {
                     Text("TLS")
                 }
+            }
+            OutlinedButton(
+                onClick = { onRunProbe(ProbeType.LAN_DISCOVERY) },
+                enabled = !probeBusy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+            ) {
+                Text("LAN Discovery Sweep (mDNS + SSDP)")
             }
         }
     }

@@ -1,5 +1,6 @@
 package com.example.dissector
 
+import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.PacketDirection
 import com.example.model.ProtocolType
@@ -114,6 +115,8 @@ object DisplayFilterParser {
             "icmp" -> return { it.protocol == ProtocolType.ICMP }
             "out", "outbound" -> return { it.direction == PacketDirection.OUTBOUND }
             "in", "inbound" -> return { it.direction == PacketDirection.INBOUND }
+            "lan", "promisc", "promiscuous" -> return { it.captureSource == CaptureSource.LAN_PROMISCUOUS }
+            "phone", "device", "vpn", "tun0" -> return { it.captureSource == CaptureSource.DEVICE_VPN }
             "tcp.flags.syn" -> return { (it.tcpFlags and PacketDissector.TCP_FLAG_SYN) != 0 }
             "tcp.flags.rst" -> return { (it.tcpFlags and PacketDissector.TCP_FLAG_RST) != 0 }
             "tcp.flags.fin" -> return { (it.tcpFlags and PacketDissector.TCP_FLAG_FIN) != 0 }
@@ -181,6 +184,19 @@ object DisplayFilterParser {
                 "frame.len" -> {
                     val len = value.toIntOrNull() ?: throw IllegalArgumentException("Length must be an integer")
                     val pred: (CapturedPacket) -> Boolean = { pkt -> pkt.length == len }
+                    pred
+                }
+                "source", "capture.source" -> {
+                    val lowerVal = value.lowercase()
+                    val pred: (CapturedPacket) -> Boolean = when (lowerVal) {
+                        "lan", "promisc", "promiscuous", "multicast", "wlan0" -> {
+                            { pkt -> pkt.captureSource == CaptureSource.LAN_PROMISCUOUS }
+                        }
+                        "phone", "device", "vpn", "tun0" -> {
+                            { pkt -> pkt.captureSource == CaptureSource.DEVICE_VPN }
+                        }
+                        else -> throw IllegalArgumentException("Source must be 'phone' or 'lan'")
+                    }
                     pred
                 }
                 else -> throw IllegalArgumentException("Unknown filter field '$field'")

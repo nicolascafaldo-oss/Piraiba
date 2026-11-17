@@ -10,10 +10,12 @@ import com.example.capture.AlertConfigStore
 import com.example.capture.AlertMonitor
 import com.example.capture.CaptureRepository
 import com.example.capture.DnsResolutionCache
+import com.example.capture.LanMulticastSniffer
 import com.example.dissector.DisplayFilterParser
 import com.example.dissector.ParsedDisplayFilter
 import com.example.dissector.PcapCodec
 import com.example.model.AlertThresholdConfig
+import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.ConversationStream
 import com.example.model.NetworkAlertEvent
@@ -25,6 +27,7 @@ import com.example.model.ProtocolType
 import com.example.model.QuickFilter
 import com.example.model.ResolvedHost
 import com.example.model.ThroughputPoint
+import com.example.model.TrafficScopeFilter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -53,13 +56,20 @@ data class CaptureUiState(
     val throughputHistory: List<ThroughputPoint> = emptyList(),
     val darkTheme: Boolean = true,
     val resolveHostnames: Boolean = true,
-    val resolvedDomains: Map<String, ResolvedHost> = emptyMap()
+    val resolvedDomains: Map<String, ResolvedHost> = emptyMap(),
+    val lanMulticastEnabled: Boolean = false,
+    val lanMulticastActive: Boolean = false,
+    val lanPacketCount: Long = 0L,
+    val trafficScopeFilter: TrafficScopeFilter = TrafficScopeFilter.ALL,
+    val phonePacketCount: Int = 0,
+    val lanBufferedPacketCount: Int = 0
 )
 
 class WireTraceViewModel : ViewModel() {
 
     private val _filterQuery = MutableStateFlow("")
     private val _quickFilter = MutableStateFlow(QuickFilter.ALL)
+    private val _trafficScopeFilter = MutableStateFlow(TrafficScopeFilter.ALL)
     private val _selectedPacketId = MutableStateFlow<Long?>(null)
     private val _autoScroll = MutableStateFlow(true)
     private val _darkTheme = MutableStateFlow(true)
@@ -157,15 +167,44 @@ class WireTraceViewModel : ViewModel() {
 
     val filteredPackets: StateFlow<List<CapturedPacket>> = combine(
         CaptureRepository.packets,
+        _trafficScopeFilter,
         parsedFilterFlow
-    ) { packets, parsed ->
-        packets.filter(parsed.matches)
+    ) { packets, scopeFilter, parsed ->
+        packets.filter { pkt ->
+            val scopeMatch = when (scopeFilter) {
+                TrafficScopeFilter.ALL -> true
+                TrafficScopeFilter.PHONE_ONLY -> pkt.captureSource == CaptureSource.DEVICE_VPN
+                TrafficScopeFilter.LAN_ONLY -> pkt.captureSource == CaptureSource.LAN_PROMISCUOUS
+            }
+            scopeMatch && parsed.matches(pkt)
+        }
     }.flowOn(Dispatchers.Default)
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+    private data class LanSummaryState(
+        val enabled: Boolean,
+        val active: Boolean,
+        val lanTotalCount: Long,
+        val scopeFilter: TrafficScopeFilter,
+        val phoneCount: Int,
+        val lanBufferedCount: Int
+    )
+
+    private val lanSummaryFlow = combine(
+        CaptureRepository.lanMulticastEnabled,
+        LanMulticastSniffer.isListening,
+        LanMulticastSniffer.lanPacketCount,
+        _trafficScopeFilter,
+        CaptureRepository.packets
+    ) { enabled, listening, count, scopeFilter, allPackets ->
+        val lanBuffered = allPackets.count { it.captureSource == CaptureSource.LAN_PROMISCUOUS }
+        val phoneBuffered = allPackets.size - lanBuffered
+        LanSummaryState(enabled, listening, count, scopeFilter, phoneBuffered, lanBuffered)
+    }
 
     val uiState: StateFlow<CaptureUiState> = combine(
         CaptureRepository.isCapturing,
@@ -181,9 +220,11 @@ class WireTraceViewModel : ViewModel() {
         CaptureRepository.throughputHistory,
         _darkTheme,
         _resolveHostnames,
-        DnsResolutionCache.resolvedHosts
+        DnsResolutionCache.resolvedHosts,
+        lanSummaryFlow
     ) { values ->
         @Suppress("UNCHECKED_CAST")
+        val lanState = values[14] as LanSummaryState
         CaptureUiState(
             isCapturing = values[0] as Boolean,
             captureStartTimeMs = values[1] as Long?,
@@ -198,7 +239,13 @@ class WireTraceViewModel : ViewModel() {
             throughputHistory = values[10] as List<ThroughputPoint>,
             darkTheme = values[11] as Boolean,
             resolveHostnames = values[12] as Boolean,
-            resolvedDomains = values[13] as Map<String, ResolvedHost>
+            resolvedDomains = values[13] as Map<String, ResolvedHost>,
+            lanMulticastEnabled = lanState.enabled,
+            lanMulticastActive = lanState.active,
+            lanPacketCount = lanState.lanTotalCount,
+            trafficScopeFilter = lanState.scopeFilter,
+            phonePacketCount = lanState.phoneCount,
+            lanBufferedPacketCount = lanState.lanBufferedCount
         )
     }.stateIn(
         scope = viewModelScope,
@@ -263,6 +310,10 @@ class WireTraceViewModel : ViewModel() {
         _quickFilter.value = filter
     }
 
+    fun setTrafficScopeFilter(scopeFilter: TrafficScopeFilter) {
+        _trafficScopeFilter.value = scopeFilter
+    }
+
     fun selectPacket(packetId: Long?) {
         _selectedPacketId.value = packetId
     }
@@ -286,8 +337,22 @@ class WireTraceViewModel : ViewModel() {
         }
     }
 
+    fun toggleLanMulticast(context: Context) {
+        val next = !CaptureRepository.lanMulticastEnabled.value
+        CaptureRepository.setLanMulticastEnabled(context.applicationContext, next)
+        _toastEvent.value = if (next) {
+            "LAN Multicast Listen active (mDNS 224.0.0.251 & SSDP 239.255.255.250)"
+        } else {
+            "LAN Multicast Listen turned off"
+        }
+    }
+
     fun filterToStream(stream: ConversationStream) {
         _quickFilter.value = QuickFilter.ALL
+        _trafficScopeFilter.value = when (stream.captureSource) {
+            CaptureSource.LAN_PROMISCUOUS -> TrafficScopeFilter.LAN_ONLY
+            CaptureSource.DEVICE_VPN -> TrafficScopeFilter.PHONE_ONLY
+        }
         val portPart = if (stream.remotePort > 0) " && port == ${stream.remotePort}" else ""
         _filterQuery.value = "ip.addr == ${stream.remoteIp}$portPart"
     }
@@ -457,7 +522,8 @@ class WireTraceViewModel : ViewModel() {
                 bytesOut = outBytes,
                 bytesIn = inBytes,
                 firstSeenMs = first.timestampMs,
-                lastSeenMs = last.timestampMs
+                lastSeenMs = last.timestampMs,
+                captureSource = first.captureSource
             )
         }.sortedByDescending { it.lastSeenMs }
     }

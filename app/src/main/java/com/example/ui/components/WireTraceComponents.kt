@@ -14,11 +14,15 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Smartphone
+import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
@@ -46,6 +50,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.model.CaptureSource
 import com.example.model.PacketDirection
 import com.example.model.ProtocolType
 import com.example.model.ThroughputPoint
@@ -103,6 +108,52 @@ fun DirectionPill(
             ),
             color = accent
         )
+    }
+}
+
+@Composable
+fun CaptureSourceBadge(
+    captureSource: CaptureSource,
+    modifier: Modifier = Modifier
+) {
+    val isLan = captureSource == CaptureSource.LAN_PROMISCUOUS
+    val accent = if (isLan) WarmGoldLive else MaterialTheme.colorScheme.secondary
+    val bgColor = if (isLan) {
+        WarmGoldLive.copy(alpha = 0.16f)
+    } else {
+        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.36f)
+    }
+    val borderColor = if (isLan) {
+        WarmGoldLive.copy(alpha = 0.55f)
+    } else {
+        MaterialTheme.colorScheme.secondary.copy(alpha = 0.35f)
+    }
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(6.dp),
+        color = bgColor,
+        border = androidx.compose.foundation.BorderStroke(1.dp, borderColor)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Icon(
+                imageVector = if (isLan) Icons.Rounded.WifiTethering else Icons.Rounded.Smartphone,
+                contentDescription = captureSource.label,
+                tint = accent,
+                modifier = Modifier.size(11.dp)
+            )
+            Text(
+                text = captureSource.shortLabel,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontFamily = MonoFontFamily,
+                    fontWeight = FontWeight.Bold
+                ),
+                color = accent
+            )
+        }
     }
 }
 
@@ -212,6 +263,8 @@ fun FilterHelpDialog(
     onDismiss: () -> Unit
 ) {
     val examples = listOf(
+        "lan" to "Show only Promiscuous LAN multicast packets",
+        "phone" to "Show only Phone (tun0) app traffic",
         "dns" to "Show only DNS queries & responses",
         "tls" to "Show TLS handshakes & encrypted flows",
         "http" to "Show cleartext HTTP requests & responses",
@@ -232,7 +285,10 @@ fun FilterHelpDialog(
             )
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
                 Text(
                     text = "Tap an example to apply it to the live filter bar:",
                     style = MaterialTheme.typography.bodySmall,

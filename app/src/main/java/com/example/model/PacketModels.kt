@@ -21,6 +21,17 @@ enum class LinkLayerType {
     ETHERNET
 }
 
+enum class CaptureSource(val label: String, val shortLabel: String) {
+    DEVICE_VPN("Phone (tun0)", "PHONE"),
+    LAN_PROMISCUOUS("LAN Promiscuous", "LAN")
+}
+
+enum class TrafficScopeFilter(val label: String) {
+    ALL("All"),
+    PHONE_ONLY("Phone"),
+    LAN_ONLY("LAN")
+}
+
 data class ProtocolField(
     val label: String,
     val value: String,
@@ -75,13 +86,15 @@ data class CapturedPacket(
     val rawBytes: ByteArray,
     val layers: List<ProtocolLayer>,
     val linkLayerType: LinkLayerType = LinkLayerType.RAW_TUN,
-    val dnsMappings: List<DnsMapping> = emptyList()
+    val dnsMappings: List<DnsMapping> = emptyList(),
+    val captureSource: CaptureSource = CaptureSource.DEVICE_VPN
 ) {
     val streamKey: String
         get() {
             val a = "$srcIp:$srcPort"
             val b = "$dstIp:$dstPort"
-            return if (a <= b) "$transportProtocol|$a|$b" else "$transportProtocol|$b|$a"
+            val prefix = captureSource.shortLabel
+            return if (a <= b) "$prefix|$transportProtocol|$a|$b" else "$prefix|$transportProtocol|$b|$a"
         }
 
     override fun equals(other: Any?): Boolean {
@@ -111,7 +124,8 @@ data class ConversationStream(
     val bytesOut: Long,
     val bytesIn: Long,
     val firstSeenMs: Long,
-    val lastSeenMs: Long
+    val lastSeenMs: Long,
+    val captureSource: CaptureSource = CaptureSource.DEVICE_VPN
 ) {
     val totalBytes: Long get() = bytesOut + bytesIn
 }
@@ -143,5 +157,6 @@ enum class QuickFilter(val label: String) {
 enum class ProbeType(val label: String, val description: String) {
     DNS_QUERY("DNS Lookup", "Send live UDP/53 DNS A-query to 8.8.8.8"),
     HTTP_GET("HTTP Request", "Send live TCP/80 GET request to example.com"),
-    HTTPS_TLS("TLS Handshake", "Perform live TCP/443 TLS 1.3 handshake with SNI")
+    HTTPS_TLS("TLS Handshake", "Perform live TCP/443 TLS 1.3 handshake with SNI"),
+    LAN_DISCOVERY("LAN Sweep", "Send mDNS & SSDP multicast discovery probes on Wi-Fi")
 }

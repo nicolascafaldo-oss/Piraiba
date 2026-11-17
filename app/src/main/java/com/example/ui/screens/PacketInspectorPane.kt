@@ -11,6 +11,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -58,15 +60,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.ProtocolLayer
 import com.example.model.ResolvedHost
+import com.example.ui.components.CaptureSourceBadge
 import com.example.ui.components.DirectionPill
 import com.example.ui.components.ProtocolBadge
 import com.example.ui.theme.LocalProtocolColors
 import com.example.ui.theme.MonoFontFamily
+import com.example.ui.theme.WarmGoldLive
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun PacketInspectorPane(
     packet: CapturedPacket?,
@@ -124,10 +129,14 @@ fun PacketInspectorPane(
             .padding(horizontal = 12.dp)
     ) {
         // Inspector Header
+        val isLanPacket = packet.captureSource == CaptureSource.LAN_PROMISCUOUS
         Surface(
             shape = RoundedCornerShape(14.dp),
             color = MaterialTheme.colorScheme.surfaceContainer,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            border = BorderStroke(
+                1.dp,
+                if (isLanPacket) WarmGoldLive.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outlineVariant
+            ),
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
@@ -139,8 +148,9 @@ fun PacketInspectorPane(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
+                    FlowRow(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         if (showBackButton) {
@@ -148,6 +158,7 @@ fun PacketInspectorPane(
                                 onClick = onBack,
                                 modifier = Modifier
                                     .size(40.dp)
+                                    .align(Alignment.CenterVertically)
                                     .testTag("inspector_back_button")
                             ) {
                                 Icon(
@@ -158,12 +169,24 @@ fun PacketInspectorPane(
                         }
                         Text(
                             text = "Frame #${packet.id}",
-                            style = MaterialTheme.typography.titleMedium.copy(fontFamily = MonoFontFamily)
+                            style = MaterialTheme.typography.titleMedium.copy(fontFamily = MonoFontFamily),
+                            modifier = Modifier.align(Alignment.CenterVertically)
                         )
-                        ProtocolBadge(protocol = packet.protocol)
-                        DirectionPill(direction = packet.direction)
+                        ProtocolBadge(
+                            protocol = packet.protocol,
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
+                        CaptureSourceBadge(
+                            captureSource = packet.captureSource,
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
+                        DirectionPill(
+                            direction = packet.direction,
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
                     }
 
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = "${packet.length} B",
                         style = MaterialTheme.typography.labelMedium.copy(fontFamily = MonoFontFamily),
