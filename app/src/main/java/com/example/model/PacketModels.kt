@@ -18,7 +18,9 @@ enum class PacketDirection(val shortLabel: String) {
 
 enum class LinkLayerType {
     RAW_TUN,
-    ETHERNET
+    ETHERNET,
+    LINUX_SLL,
+    LINUX_SLL2
 }
 
 enum class CaptureSource(val label: String, val shortLabel: String) {
@@ -52,10 +54,13 @@ data class DnsMapping(
 )
 
 enum class ResolutionSource(val shortLabel: String, val priority: Int) {
+    WELL_KNOWN("MCAST", 0),
     REVERSE_PTR("PTR", 1),
-    HTTP_HOST("HTTP", 2),
-    TLS_SNI("SNI", 3),
-    DNS_ANSWER("DNS", 4)
+    SSDP_INFO("SSDP", 2),
+    MDNS_LAN("mDNS", 3),
+    HTTP_HOST("HTTP", 4),
+    TLS_SNI("SNI", 5),
+    DNS_ANSWER("DNS", 6)
 }
 
 data class ResolvedHost(
@@ -160,3 +165,26 @@ enum class ProbeType(val label: String, val description: String) {
     HTTPS_TLS("TLS Handshake", "Perform live TCP/443 TLS 1.3 handshake with SNI"),
     LAN_DISCOVERY("LAN Sweep", "Send mDNS & SSDP multicast discovery probes on Wi-Fi")
 }
+
+enum class RootSandboxStatus(val label: String) {
+    UNCHECKED("Not Probed"),
+    CHECKING("Probing Root..."),
+    ROOT_READY("Root Ready"),
+    ROOT_RUNNING("Root Capture Active"),
+    NO_ROOT_OR_DENIED("No Root Access"),
+    NO_TCPDUMP("tcpdump Missing"),
+    ERROR("Sandbox Error")
+}
+
+data class RootSandboxState(
+    val status: RootSandboxStatus = RootSandboxStatus.UNCHECKED,
+    val suAvailable: Boolean = false,
+    val tcpdumpPath: String? = null,
+    val availableInterfaces: List<String> = listOf("wlan0", "any"),
+    val selectedInterface: String = "wlan0",
+    val bpfFilter: String = "",
+    val promiscuousMode: Boolean = true,
+    val capturedFrames: Long = 0L,
+    val statusDetail: String = "Tap Probe Sandbox to check for system su + tcpdump on this device.",
+    val consoleLogs: List<String> = emptyList()
+)

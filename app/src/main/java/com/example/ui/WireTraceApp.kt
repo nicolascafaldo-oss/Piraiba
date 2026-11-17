@@ -87,6 +87,7 @@ import androidx.navigation.compose.rememberNavController
 import com.example.R
 import com.example.capture.AlertConfigStore
 import com.example.capture.CaptureRepository
+import com.example.model.ProbeType
 import com.example.model.QuickFilter
 import com.example.ui.components.ExportPcapDialog
 import com.example.ui.components.LiveCaptureIndicator
@@ -95,6 +96,7 @@ import com.example.ui.screens.AnalyticsScreen
 import com.example.ui.screens.CaptureScreen
 import com.example.ui.screens.FollowStreamDialog
 import com.example.ui.screens.PacketInspectorPane
+import com.example.ui.screens.PromiscuousSandboxDialog
 import com.example.ui.screens.StreamsScreen
 import com.example.ui.theme.WireTraceTheme
 import com.example.viewmodel.WireTraceViewModel
@@ -126,6 +128,7 @@ fun WireTraceApp(
     val alertEvents by viewModel.alertEvents.collectAsStateWithLifecycle()
     val unreadAlertCount by viewModel.unreadAlertCount.collectAsStateWithLifecycle()
     val latestAlertEvent by viewModel.latestAlertEvent.collectAsStateWithLifecycle()
+    val rootSandboxState by viewModel.rootSandboxState.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
@@ -133,6 +136,7 @@ fun WireTraceApp(
     val navController = rememberNavController()
     var showMenu by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
+    var showPromiscuousSandbox by remember { mutableStateOf(false) }
     var pendingExportFilteredOnly by remember { mutableStateOf(false) }
     var followStreamKey by remember { mutableStateOf<String?>(null) }
     var vpnIssueDialogMessage by remember { mutableStateOf<String?>(null) }
@@ -344,12 +348,30 @@ fun WireTraceApp(
                 onDismiss = { showExportDialog = false }
             )
         }
+        if (showPromiscuousSandbox) {
+            PromiscuousSandboxDialog(
+                sandboxState = rootSandboxState,
+                lanMulticastActive = uiState.lanMulticastEnabled,
+                probeBusy = probeBusy,
+                onProbeRoot = viewModel::probeRootSandbox,
+                onSelectInterface = viewModel::setRootSandboxInterface,
+                onBpfFilterChange = viewModel::setRootSandboxBpfFilter,
+                onTogglePromiscuousMode = viewModel::setRootSandboxPromiscuous,
+                onStartRootCapture = viewModel::startRootSandboxCapture,
+                onStopRootCapture = viewModel::stopRootSandboxCapture,
+                onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
+                onRunLanSweep = { viewModel.runProbe(ProbeType.LAN_DISCOVERY) },
+                onDismiss = { showPromiscuousSandbox = false }
+            )
+        }
         if (followStreamKey != null) {
             val streamKey = followStreamKey!!
             val streamPackets = viewModel.packetsForStream(streamKey)
             FollowStreamDialog(
                 streamKey = streamKey,
                 packets = streamPackets,
+                resolvedDomains = uiState.resolvedDomains,
+                resolveHostnames = uiState.resolveHostnames,
                 onFilterToStream = {
                     conversations.find { it.key == streamKey }?.let { stream ->
                         viewModel.filterToStream(stream)
@@ -605,6 +627,7 @@ fun WireTraceApp(
                                 Row(modifier = Modifier.fillMaxSize()) {
                                     CaptureScreen(
                                         uiState = uiState,
+                                        rootSandboxState = rootSandboxState,
                                         probeBusy = probeBusy,
                                         onStartCapture = ::requestStartCapture,
                                         onOpenPcap = { importPcapLauncher.launch(arrayOf("*/*")) },
@@ -615,6 +638,7 @@ fun WireTraceApp(
                                         onToggleAutoScroll = viewModel::toggleAutoScroll,
                                         onToggleResolveHostnames = viewModel::toggleResolveHostnames,
                                         onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
+                                        onOpenPromiscuousSandbox = { showPromiscuousSandbox = true },
                                         onSelectPacket = { pkt -> viewModel.selectPacket(pkt.id) },
                                         modifier = Modifier.weight(0.52f)
                                     )
@@ -635,6 +659,7 @@ fun WireTraceApp(
                             } else {
                                 CaptureScreen(
                                     uiState = uiState,
+                                    rootSandboxState = rootSandboxState,
                                     probeBusy = probeBusy,
                                     onStartCapture = ::requestStartCapture,
                                     onOpenPcap = { importPcapLauncher.launch(arrayOf("*/*")) },
@@ -645,6 +670,7 @@ fun WireTraceApp(
                                     onToggleAutoScroll = viewModel::toggleAutoScroll,
                                     onToggleResolveHostnames = viewModel::toggleResolveHostnames,
                                     onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
+                                    onOpenPromiscuousSandbox = { showPromiscuousSandbox = true },
                                     onSelectPacket = { pkt ->
                                         viewModel.selectPacket(pkt.id)
                                         navController.navigate(WireTraceRoutes.INSPECTOR)
@@ -670,6 +696,8 @@ fun WireTraceApp(
                         composable(WireTraceRoutes.STREAMS) {
                             StreamsScreen(
                                 streams = conversations,
+                                resolvedDomains = uiState.resolvedDomains,
+                                resolveHostnames = uiState.resolveHostnames,
                                 onSelectStream = { stream -> followStreamKey = stream.key },
                                 onFilterToStream = { stream ->
                                     viewModel.filterToStream(stream)

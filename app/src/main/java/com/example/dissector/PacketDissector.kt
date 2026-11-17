@@ -39,8 +39,11 @@ object PacketDissector {
         val layers = mutableListOf<ProtocolLayer>()
 
         val interfaceLabel = when {
+            captureSource == CaptureSource.LAN_PROMISCUOUS && linkLayerType == LinkLayerType.ETHERNET -> "wlan0 (Promiscuous Root)"
+            captureSource == CaptureSource.LAN_PROMISCUOUS && (linkLayerType == LinkLayerType.LINUX_SLL || linkLayerType == LinkLayerType.LINUX_SLL2) -> "any (Promiscuous Root)"
             captureSource == CaptureSource.LAN_PROMISCUOUS -> "wlan0 (Promiscuous LAN Multicast)"
             linkLayerType == LinkLayerType.ETHERNET -> "eth0 (Ethernet II)"
+            linkLayerType == LinkLayerType.LINUX_SLL || linkLayerType == LinkLayerType.LINUX_SLL2 -> "any (Linux Cooked)"
             else -> "tun0 (Raw IP)"
         }
         layers.add(
@@ -65,61 +68,129 @@ object PacketDissector {
         )
 
         var l3Offset = 0
-        if (linkLayerType == LinkLayerType.ETHERNET) {
-            if (len < 14) {
-                return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Truncated Ethernet frame")
-                    .copy(captureSource = captureSource)
-            }
-            val dstMac = macString(rawBytes, 0)
-            val srcMac = macString(rawBytes, 6)
-            val etherType = u16(rawBytes, 12)
-            val etherTypeLabel = when (etherType) {
-                0x0800 -> "IPv4 (0x0800)"
-                0x86DD -> "IPv6 (0x86dd)"
-                0x0806 -> "ARP (0x0806)"
-                else -> "0x${etherType.toString(16).padStart(4, '0')}"
-            }
-            layers.add(
-                ProtocolLayer(
-                    name = "Ethernet II, Src: $srcMac, Dst: $dstMac",
-                    byteStart = 0,
-                    byteEnd = 14,
-                    fields = listOf(
-                        ProtocolField("Destination MAC", dstMac, 0, 6),
-                        ProtocolField("Source MAC", srcMac, 6, 12),
-                        ProtocolField("Type", etherTypeLabel, 12, 14)
+        when (linkLayerType) {
+            LinkLayerType.ETHERNET -> {
+                if (len < 14) {
+                    return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Truncated Ethernet frame")
+                        .copy(captureSource = captureSource)
+                }
+                val dstMac = macString(rawBytes, 0)
+                val srcMac = macString(rawBytes, 6)
+                val etherType = u16(rawBytes, 12)
+                val etherTypeLabel = etherTypeName(etherType)
+                layers.add(
+                    ProtocolLayer(
+                        name = "Ethernet II, Src: $srcMac, Dst: $dstMac",
+                        byteStart = 0,
+                        byteEnd = 14,
+                        fields = listOf(
+                            ProtocolField("Destination MAC", dstMac, 0, 6),
+                            ProtocolField("Source MAC", srcMac, 6, 12),
+                            ProtocolField("Type", etherTypeLabel, 12, 14)
+                        )
                     )
                 )
-            )
-            l3Offset = 14
-            if (etherType != 0x0800 && etherType != 0x86DD) {
-                return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Ethernet $etherTypeLabel")
-                    .copy(captureSource = captureSource)
+                l3Offset = 14
+                if (etherType == 0x0806) {
+                    return dissectArp(id, rawBytes, l3Offset, timestampMs, relativeTimeMs, direction, linkLayerType, layers)
+                        .copy(captureSource = captureSource)
+                }
+                if (etherType != 0x0800 && etherType != 0x86DD) {
+                    return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Ethernet $etherTypeLabel")
+                        .copy(captureSource = captureSource)
+                }
             }
-        } else if (captureSource == CaptureSource.LAN_PROMISCUOUS) {
-            layers.add(
-                ProtocolLayer(
-                    name = "Link Layer: Wi-Fi LAN Promiscuous Multicast (wlan0)",
-                    byteStart = 0,
-                    byteEnd = 0,
-                    fields = listOf(
-                        ProtocolField("Capture Mode", "WifiManager.MulticastLock (mDNS / SSDP)", 0, 0),
-                        ProtocolField("Scope", "Local Wi-Fi Broadcast / Multicast Domain", 0, 0)
+            LinkLayerType.LINUX_SLL -> {
+                if (len < 16) {
+                    return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Truncated Linux SLL frame")
+                        .copy(captureSource = captureSource)
+                }
+                val pktType = u16(rawBytes, 0)
+                val addrLen = u16(rawBytes, 4).coerceAtMost(8)
+                val srcMac = if (addrLen == 6) macString(rawBytes, 6) else "—"
+                val etherType = u16(rawBytes, 14)
+                val etherTypeLabel = etherTypeName(etherType)
+                layers.add(
+                    ProtocolLayer(
+                        name = "Linux Cooked Capture v1 (SLL), Src: $srcMac",
+                        byteStart = 0,
+                        byteEnd = 16,
+                        fields = listOf(
+                            ProtocolField("Packet Type", "$pktType", 0, 2),
+                            ProtocolField("Link Address", srcMac, 6, 14),
+                            ProtocolField("Protocol", etherTypeLabel, 14, 16)
+                        )
                     )
                 )
-            )
-        } else {
-            layers.add(
-                ProtocolLayer(
-                    name = "Link Layer: Android VPN TUN (tun0, Raw IPv4/IPv6)",
-                    byteStart = 0,
-                    byteEnd = 0,
-                    fields = listOf(
-                        ProtocolField("Encapsulation", "Raw IP (LINKTYPE_RAW / 101)", 0, 0),
-                        ProtocolField("Virtual Interface", "tun0 (MTU 1500)", 0, 0)
+                l3Offset = 16
+                if (etherType == 0x0806) {
+                    return dissectArp(id, rawBytes, l3Offset, timestampMs, relativeTimeMs, direction, linkLayerType, layers)
+                        .copy(captureSource = captureSource)
+                }
+                if (etherType != 0x0800 && etherType != 0x86DD) {
+                    return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Linux SLL $etherTypeLabel")
+                        .copy(captureSource = captureSource)
+                }
+            }
+            LinkLayerType.LINUX_SLL2 -> {
+                if (len < 20) {
+                    return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Truncated Linux SLL2 frame")
+                        .copy(captureSource = captureSource)
+                }
+                val etherType = u16(rawBytes, 0)
+                val ifIndex = u32(rawBytes, 4)
+                val addrLen = u8(rawBytes, 11).coerceAtMost(8)
+                val srcMac = if (addrLen == 6) macString(rawBytes, 12) else "—"
+                val etherTypeLabel = etherTypeName(etherType)
+                layers.add(
+                    ProtocolLayer(
+                        name = "Linux Cooked Capture v2 (SLL2), ifIndex=$ifIndex",
+                        byteStart = 0,
+                        byteEnd = 20,
+                        fields = listOf(
+                            ProtocolField("Protocol", etherTypeLabel, 0, 2),
+                            ProtocolField("Interface Index", "$ifIndex", 4, 8),
+                            ProtocolField("Link Address", srcMac, 12, 20)
+                        )
                     )
                 )
-            )
+                l3Offset = 20
+                if (etherType == 0x0806) {
+                    return dissectArp(id, rawBytes, l3Offset, timestampMs, relativeTimeMs, direction, linkLayerType, layers)
+                        .copy(captureSource = captureSource)
+                }
+                if (etherType != 0x0800 && etherType != 0x86DD) {
+                    return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Linux SLL2 $etherTypeLabel")
+                        .copy(captureSource = captureSource)
+                }
+            }
+            LinkLayerType.RAW_TUN -> {
+                if (captureSource == CaptureSource.LAN_PROMISCUOUS) {
+                    layers.add(
+                        ProtocolLayer(
+                            name = "Link Layer: Wi-Fi LAN Promiscuous Multicast (wlan0)",
+                            byteStart = 0,
+                            byteEnd = 0,
+                            fields = listOf(
+                                ProtocolField("Capture Mode", "WifiManager.MulticastLock (mDNS / SSDP / LLMNR)", 0, 0),
+                                ProtocolField("Scope", "Local Wi-Fi Broadcast / Multicast Domain", 0, 0)
+                            )
+                        )
+                    )
+                } else {
+                    layers.add(
+                        ProtocolLayer(
+                            name = "Link Layer: Android VPN TUN (tun0, Raw IPv4/IPv6)",
+                            byteStart = 0,
+                            byteEnd = 0,
+                            fields = listOf(
+                                ProtocolField("Encapsulation", "Raw IP (LINKTYPE_RAW / 101)", 0, 0),
+                                ProtocolField("Virtual Interface", "tun0 (MTU 1500)", 0, 0)
+                            )
+                        )
+                    )
+                }
+            }
         }
 
         if (l3Offset >= len) {
@@ -134,6 +205,79 @@ object PacketDissector {
             else -> fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, rawBytes, layers, "Unknown L3 version ($ipVersion)")
         }
         return parsed.copy(captureSource = captureSource)
+    }
+
+    private fun etherTypeName(etherType: Int): String = when (etherType) {
+        0x0800 -> "IPv4 (0x0800)"
+        0x86DD -> "IPv6 (0x86dd)"
+        0x0806 -> "ARP (0x0806)"
+        else -> "0x${etherType.toString(16).padStart(4, '0')}"
+    }
+
+    private fun dissectArp(
+        id: Long,
+        raw: ByteArray,
+        offset: Int,
+        timestampMs: Long,
+        relativeTimeMs: Long,
+        direction: PacketDirection,
+        linkLayerType: LinkLayerType,
+        layers: MutableList<ProtocolLayer>
+    ): CapturedPacket {
+        if (offset + 28 > raw.size) {
+            return fallbackPacket(id, timestampMs, relativeTimeMs, direction, linkLayerType, raw, layers, "Truncated ARP packet")
+        }
+        val opCode = u16(raw, offset + 6)
+        val senderMac = macString(raw, offset + 8)
+        val senderIp = ipv4String(raw, offset + 14)
+        val targetMac = macString(raw, offset + 18)
+        val targetIp = ipv4String(raw, offset + 24)
+        val opLabel = when (opCode) {
+            1 -> "Request"
+            2 -> "Reply"
+            else -> "Op($opCode)"
+        }
+        val info = when (opCode) {
+            1 -> "ARP Who has $targetIp? Tell $senderIp ($senderMac)"
+            2 -> "ARP $senderIp is at $senderMac"
+            else -> "ARP $opLabel $senderIp → $targetIp"
+        }
+        layers.add(
+            ProtocolLayer(
+                name = "Address Resolution Protocol ($opLabel)",
+                byteStart = offset,
+                byteEnd = offset + 28,
+                fields = listOf(
+                    ProtocolField("Opcode", "$opLabel ($opCode)", offset + 6, offset + 8),
+                    ProtocolField("Sender MAC", senderMac, offset + 8, offset + 14),
+                    ProtocolField("Sender IP", senderIp, offset + 14, offset + 18),
+                    ProtocolField("Target MAC", targetMac, offset + 18, offset + 24),
+                    ProtocolField("Target IP", targetIp, offset + 24, offset + 28)
+                )
+            )
+        )
+        return CapturedPacket(
+            id = id,
+            timestampMs = timestampMs,
+            relativeTimeMs = relativeTimeMs,
+            direction = direction,
+            ipVersion = 0,
+            srcIp = senderIp,
+            dstIp = targetIp,
+            srcPort = 0,
+            dstPort = 0,
+            transportProtocol = "ARP",
+            protocol = ProtocolType.OTHER,
+            length = raw.size,
+            hostOrSni = null,
+            infoSummary = info,
+            tcpFlags = 0,
+            payloadOffset = offset,
+            payloadLength = 28,
+            rawBytes = raw,
+            layers = layers,
+            linkLayerType = linkLayerType
+        )
     }
 
     private fun dissectIpv4(
@@ -537,8 +681,15 @@ object PacketDissector {
 
         if (payloadLen > 0 && payloadOffset + payloadLen <= raw.size) {
             when {
-                srcPort == 53 || dstPort == 53 || srcPort == 5353 || dstPort == 5353 -> {
-                    val dns = dissectDns(raw, payloadOffset, payloadLen)
+                srcPort == 53 || dstPort == 53 || srcPort == 5353 || dstPort == 5353 || srcPort == 5355 || dstPort == 5355 -> {
+                    val isMdns = srcPort == 5353 || dstPort == 5353
+                    val isLlmnr = srcPort == 5355 || dstPort == 5355
+                    val dnsLabel = when {
+                        isMdns -> "Multicast DNS (mDNS)"
+                        isLlmnr -> "Link-Local Multicast Name Resolution (LLMNR)"
+                        else -> "Domain Name System"
+                    }
+                    val dns = dissectDns(raw, payloadOffset, payloadLen, dnsLabel)
                     if (dns != null) {
                         detectedProtocol = ProtocolType.DNS
                         hostOrSni = dns.domain
@@ -547,6 +698,31 @@ object PacketDissector {
                         layers.add(dns.layer)
                     } else {
                         layers.add(buildRawPayloadLayer("UDP Payload Data ($payloadLen bytes)", raw, payloadOffset, payloadLen))
+                    }
+                }
+                srcPort == 1900 || dstPort == 1900 || srcPort == 3702 || dstPort == 3702 -> {
+                    val ssdp = dissectSsdpOrDiscovery(raw, payloadOffset, payloadLen, srcIp)
+                    if (ssdp != null) {
+                        detectedProtocol = ProtocolType.HTTP
+                        hostOrSni = ssdp.deviceLabel
+                        infoSummary = ssdp.summary
+                        if (ssdp.deviceLabel != null && !srcIp.startsWith("239.")) {
+                            dnsMappings = listOf(DnsMapping(ip = srcIp, domain = ssdp.deviceLabel))
+                        }
+                        layers.add(ssdp.layer)
+                    } else {
+                        layers.add(buildRawPayloadLayer("UDP Discovery Payload ($payloadLen bytes)", raw, payloadOffset, payloadLen))
+                    }
+                }
+                srcPort == 137 || dstPort == 137 -> {
+                    val nbns = dissectNbns(raw, payloadOffset, payloadLen)
+                    if (nbns != null) {
+                        detectedProtocol = ProtocolType.DNS
+                        hostOrSni = nbns.first
+                        infoSummary = nbns.second
+                        layers.add(buildRawPayloadLayer("NetBIOS Name Service (${nbns.first ?: "$payloadLen B"})", raw, payloadOffset, payloadLen))
+                    } else {
+                        layers.add(buildRawPayloadLayer("NetBIOS Payload ($payloadLen bytes)", raw, payloadOffset, payloadLen))
                     }
                 }
                 srcPort == 443 || dstPort == 443 -> {
@@ -694,7 +870,12 @@ object PacketDissector {
         val mappings: List<DnsMapping>
     )
 
-    private fun dissectDns(raw: ByteArray, offset: Int, len: Int): DnsDissection? {
+    private fun dissectDns(
+        raw: ByteArray,
+        offset: Int,
+        len: Int,
+        protocolLabel: String = "Domain Name System"
+    ): DnsDissection? {
         if (len < 12 || offset + 12 > raw.size) return null
         val txId = u16(raw, offset)
         val flags = u16(raw, offset + 2)
@@ -716,15 +897,15 @@ object PacketDissector {
         var firstDomain: String? = null
         var firstQType = ""
 
-        for (q in 0 until minOf(qdCount, 4)) {
+        for (q in 0 until minOf(qdCount, 6)) {
             if (cursor >= end) break
             val nameResult = readDnsName(raw, offset, end, cursor) ?: break
             val (name, nextCursor) = nameResult
             if (nextCursor + 4 > end) break
             val qType = u16(raw, nextCursor)
-            val qClass = u16(raw, nextCursor + 2)
+            val qClass = u16(raw, nextCursor + 2) and 0x7FFF
             val qTypeName = dnsTypeName(qType)
-            if (firstDomain == null) {
+            if (firstDomain == null && name != "<root>") {
                 firstDomain = name
                 firstQType = qTypeName
             }
@@ -743,53 +924,70 @@ object PacketDissector {
         val extractedMappings = mutableListOf<DnsMapping>()
         val cnameTargets = mutableSetOf<String>()
 
-        for (a in 0 until minOf(anCount, 8)) {
-            if (cursor >= end) break
-            val nameResult = readDnsName(raw, offset, end, cursor) ?: break
-            val (aName, nextCursor) = nameResult
-            if (nextCursor + 10 > end) break
-            val rType = u16(raw, nextCursor)
-            val ttl = u32(raw, nextCursor + 4)
-            val rdLen = u16(raw, nextCursor + 8)
-            val rDataStart = nextCursor + 10
-            val rDataEnd = (rDataStart + rdLen).coerceAtMost(end)
-            val rTypeName = dnsTypeName(rType)
-            val rDataText = when (rType) {
-                1 -> if (rDataEnd - rDataStart == 4) ipv4String(raw, rDataStart) else "$rdLen B"
-                28 -> if (rDataEnd - rDataStart == 16) ipv6String(raw, rDataStart) else "$rdLen B"
-                5, 12, 2 -> readDnsName(raw, offset, end, rDataStart)?.first ?: "$rdLen B"
-                else -> "$rdLen bytes"
-            }
+        fun parseResourceRecords(sectionLabel: String, count: Int, collectSummary: Boolean) {
+            for (idx in 0 until minOf(count, 10)) {
+                if (cursor >= end) break
+                val nameResult = readDnsName(raw, offset, end, cursor) ?: break
+                val (aName, nextCursor) = nameResult
+                if (nextCursor + 10 > end) break
+                val rType = u16(raw, nextCursor)
+                val ttl = u32(raw, nextCursor + 4)
+                val rdLen = u16(raw, nextCursor + 8)
+                val rDataStart = nextCursor + 10
+                val rDataEnd = (rDataStart + rdLen).coerceAtMost(end)
+                val rTypeName = dnsTypeName(rType)
+                val rDataText = when (rType) {
+                    1 -> if (rDataEnd - rDataStart == 4) ipv4String(raw, rDataStart) else "$rdLen B"
+                    28 -> if (rDataEnd - rDataStart == 16) ipv6String(raw, rDataStart) else "$rdLen B"
+                    5, 12, 2 -> readDnsName(raw, offset, end, rDataStart)?.first ?: "$rdLen B"
+                    33 -> if (rDataStart + 6 <= rDataEnd) {
+                        val srvPort = u16(raw, rDataStart + 4)
+                        val target = readDnsName(raw, offset, end, rDataStart + 6)?.first ?: "?"
+                        "$target:$srvPort"
+                    } else "$rdLen B"
+                    else -> "$rdLen bytes"
+                }
 
-            if (rType == 5 && rDataText != "<root>" && !rDataText.endsWith(" B")) {
-                cnameTargets.add(rDataText)
-            } else if ((rType == 1 && rDataEnd - rDataStart == 4) || (rType == 28 && rDataEnd - rDataStart == 16)) {
-                val resolvedDomain = when {
-                    aName in cnameTargets && !firstDomain.isNullOrBlank() && firstDomain != "<root>" -> firstDomain
-                    aName != "<root>" && aName.isNotBlank() -> aName
-                    !firstDomain.isNullOrBlank() && firstDomain != "<root>" -> firstDomain
-                    else -> null
+                if (rType == 5 && rDataText != "<root>" && !rDataText.endsWith(" B")) {
+                    cnameTargets.add(rDataText)
+                } else if ((rType == 1 && rDataEnd - rDataStart == 4) || (rType == 28 && rDataEnd - rDataStart == 16)) {
+                    val resolvedDomain = when {
+                        aName in cnameTargets && !firstDomain.isNullOrBlank() && firstDomain != "<root>" -> firstDomain
+                        aName != "<root>" && aName.isNotBlank() -> aName
+                        !firstDomain.isNullOrBlank() && firstDomain != "<root>" -> firstDomain
+                        else -> null
+                    }
+                    if (resolvedDomain != null && !resolvedDomain.endsWith(".arpa", ignoreCase = true)) {
+                        extractedMappings.add(DnsMapping(ip = rDataText, domain = resolvedDomain))
+                        if (firstDomain == null) firstDomain = resolvedDomain
+                    }
+                } else if (rType == 12 && aName.endsWith(".in-addr.arpa", ignoreCase = true) && rDataText != "<root>" && !rDataText.endsWith(" B")) {
+                    parsePtrArpaToIpv4(aName)?.let { ptrIp ->
+                        extractedMappings.add(DnsMapping(ip = ptrIp, domain = rDataText))
+                        if (firstDomain == null) firstDomain = rDataText
+                    }
+                } else if (rType == 12 && rDataText != "<root>" && !rDataText.endsWith(" B")) {
+                    if (firstDomain == null || firstDomain?.startsWith("_services") == true) {
+                        firstDomain = rDataText
+                    }
                 }
-                if (resolvedDomain != null && !resolvedDomain.endsWith(".arpa", ignoreCase = true)) {
-                    extractedMappings.add(DnsMapping(ip = rDataText, domain = resolvedDomain))
-                }
-            } else if (rType == 12 && aName.endsWith(".in-addr.arpa", ignoreCase = true) && rDataText != "<root>" && !rDataText.endsWith(" B")) {
-                parsePtrArpaToIpv4(aName)?.let { ptrIp ->
-                    extractedMappings.add(DnsMapping(ip = ptrIp, domain = rDataText))
-                }
-            }
 
-            answerSummaries.add(rDataText)
-            fields.add(
-                ProtocolField(
-                    label = "Answer ${a + 1}",
-                    value = "$aName → $rTypeName $rDataText (TTL ${ttl}s)",
-                    byteStart = cursor,
-                    byteEnd = rDataEnd
+                if (collectSummary) answerSummaries.add(rDataText)
+                fields.add(
+                    ProtocolField(
+                        label = "$sectionLabel ${idx + 1}",
+                        value = "$aName → $rTypeName $rDataText (TTL ${ttl}s)",
+                        byteStart = cursor,
+                        byteEnd = rDataEnd
+                    )
                 )
-            )
-            cursor = rDataEnd
+                cursor = rDataEnd
+            }
         }
+
+        parseResourceRecords("Answer", anCount, collectSummary = true)
+        parseResourceRecords("Authority", nsCount, collectSummary = false)
+        parseResourceRecords("Additional", arCount, collectSummary = false)
 
         val rcodeText = when (rcode) {
             0 -> ""
@@ -809,13 +1007,111 @@ object PacketDissector {
             domain = firstDomain,
             summary = summary,
             layer = ProtocolLayer(
-                name = "Domain Name System (${if (isResponse) "response" else "query"})",
+                name = "$protocolLabel (${if (isResponse) "response" else "query"})",
                 byteStart = offset,
                 byteEnd = end,
                 fields = fields
             ),
             mappings = extractedMappings
         )
+    }
+
+    private data class SsdpDissection(
+        val deviceLabel: String?,
+        val summary: String,
+        val layer: ProtocolLayer
+    )
+
+    private fun dissectSsdpOrDiscovery(
+        raw: ByteArray,
+        offset: Int,
+        len: Int,
+        srcIp: String
+    ): SsdpDissection? {
+        if (len < 8 || offset + len > raw.size) return null
+        val end = minOf(raw.size, offset + len)
+        val text = String(raw, offset, end - offset, StandardCharsets.UTF_8)
+        val lines = text.split("\r\n", "\n").filter { it.isNotBlank() }
+        if (lines.isEmpty()) return null
+        val firstLine = lines.first().trim()
+
+        if (firstLine.startsWith("<?xml", ignoreCase = true) || text.contains("Probe", ignoreCase = true) && text.contains("schemas.xmlsoap.org")) {
+            return SsdpDissection(
+                deviceLabel = null,
+                summary = "WS-Discovery XML ($len bytes)",
+                layer = buildRawPayloadLayer("WS-Discovery Payload ($len bytes)", raw, offset, len)
+            )
+        }
+        if (!firstLine.startsWith("M-SEARCH", ignoreCase = true) &&
+            !firstLine.startsWith("NOTIFY", ignoreCase = true) &&
+            !firstLine.startsWith("HTTP/1.", ignoreCase = true)
+        ) {
+            return null
+        }
+
+        val fields = mutableListOf(ProtocolField("Request / Status", firstLine, offset, end))
+        var stOrNt: String? = null
+        var serverHeader: String? = null
+        var locationUrl: String? = null
+
+        for (line in lines.drop(1).take(12)) {
+            val colon = line.indexOf(':')
+            if (colon > 0) {
+                val k = line.substring(0, colon).trim()
+                val v = line.substring(colon + 1).trim()
+                fields.add(ProtocolField(k, v, offset, end))
+                when {
+                    k.equals("ST", ignoreCase = true) || k.equals("NT", ignoreCase = true) -> {
+                        if (stOrNt == null) stOrNt = v
+                    }
+                    k.equals("SERVER", ignoreCase = true) -> serverHeader = v
+                    k.equals("LOCATION", ignoreCase = true) -> locationUrl = v
+                }
+            }
+        }
+
+        val friendlyLabel = serverHeader
+            ?.substringBefore(' ')
+            ?.substringBefore('/')
+            ?.takeIf { it.length >= 2 && it != "Linux" && it != "UPnP" }
+            ?: stOrNt?.substringAfterLast(':')?.takeIf { it.isNotBlank() && it != "all" }
+
+        val summary = buildString {
+            append("SSDP ")
+            append(firstLine.substringBefore(" HTTP/"))
+            if (!stOrNt.isNullOrBlank()) append(" ($stOrNt)")
+            else if (!locationUrl.isNullOrBlank()) append(" [$locationUrl]")
+            else append(" from $srcIp")
+        }
+
+        return SsdpDissection(
+            deviceLabel = friendlyLabel,
+            summary = summary,
+            layer = ProtocolLayer(
+                name = "Simple Service Discovery Protocol (SSDP)",
+                byteStart = offset,
+                byteEnd = end,
+                fields = fields
+            )
+        )
+    }
+
+    private fun dissectNbns(raw: ByteArray, offset: Int, len: Int): Pair<String?, String>? {
+        if (len < 50 || offset + 50 > raw.size) return null
+        val flags = u16(raw, offset + 2)
+        val isResponse = (flags and 0x8000) != 0
+        val nameLen = u8(raw, offset + 12)
+        if (nameLen != 32 || offset + 13 + 32 > raw.size) return null
+        val decoded = StringBuilder(16)
+        for (i in 0 until 15) {
+            val c1 = u8(raw, offset + 13 + i * 2) - 'A'.code
+            val c2 = u8(raw, offset + 14 + i * 2) - 'A'.code
+            val ch = ((c1 shl 4) or (c2 and 0x0F)).toChar()
+            if (ch in ' '..'~') decoded.append(ch)
+        }
+        val hostName = decoded.toString().trim().takeIf { it.isNotBlank() }
+        val kind = if (isResponse) "Registration / Response" else "Name Query"
+        return hostName to "NBNS $kind ${hostName ?: ""}".trim()
     }
 
     private fun parsePtrArpaToIpv4(qname: String): String? {

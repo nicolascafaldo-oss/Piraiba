@@ -89,20 +89,35 @@ object DnsResolutionCache {
     private fun ingestPacketInternal(packet: CapturedPacket): Boolean {
         var changed = false
 
-        // 1. High-confidence passive mappings directly from dissected DNS A/AAAA/PTR answers
+        // 0. Label well-known LAN multicast / broadcast endpoints automatically
+        if (seedWellKnownEndpoint(packet.srcIp, packet.timestampMs)) changed = true
+        if (seedWellKnownEndpoint(packet.dstIp, packet.timestampMs)) changed = true
+
+        // 1. Passive mappings from dissected DNS / mDNS / LLMNR / SSDP records
+        val isMdnsOrLlmnr = packet.srcPort == 5353 || packet.dstPort == 5353 ||
+            packet.srcPort == 5355 || packet.dstPort == 5355
+        val isSsdp = packet.srcPort == 1900 || packet.dstPort == 1900 ||
+            packet.srcPort == 3702 || packet.dstPort == 3702
+        val mappingSource = when {
+            isSsdp -> ResolutionSource.SSDP_INFO
+            isMdnsOrLlmnr -> ResolutionSource.MDNS_LAN
+            else -> ResolutionSource.DNS_ANSWER
+        }
         for (mapping in packet.dnsMappings) {
-            if (putMappingInternal(mapping.ip, mapping.domain, ResolutionSource.DNS_ANSWER, packet.timestampMs)) {
+            if (putMappingInternal(mapping.ip, mapping.domain, mappingSource, packet.timestampMs)) {
                 changed = true
             }
         }
 
-        // 2. Passive mappings from TLS SNI or HTTP Host headers to the remote IP
+        // 2. Passive mappings from TLS SNI, HTTP Host, NBNS, or mDNS/SSDP peer headers
         val remoteIp = if (packet.direction == PacketDirection.OUTBOUND) packet.dstIp else packet.srcIp
         val hostCandidate = packet.hostOrSni?.let { normalizeHostname(it) }
         if (!hostCandidate.isNullOrBlank()) {
-            val source = when (packet.protocol) {
-                ProtocolType.TLS -> ResolutionSource.TLS_SNI
-                ProtocolType.HTTP -> ResolutionSource.HTTP_HOST
+            val source = when {
+                packet.protocol == ProtocolType.TLS -> ResolutionSource.TLS_SNI
+                isSsdp -> ResolutionSource.SSDP_INFO
+                packet.protocol == ProtocolType.HTTP -> ResolutionSource.HTTP_HOST
+                (packet.srcPort == 137 || packet.dstPort == 137) -> ResolutionSource.MDNS_LAN
                 else -> null
             }
             if (source != null && putMappingInternal(remoteIp, hostCandidate, source, packet.timestampMs)) {
@@ -110,13 +125,24 @@ object DnsResolutionCache {
             }
         }
 
-        // 3. Queue asynchronous reverse PTR lookup for unresolved public endpoints
+        // 3. Queue asynchronous reverse PTR / mDNS-PTR lookup for unresolved public and LAN endpoints
         if (autoPtrEnabled) {
             maybeEnqueuePtr(packet.srcIp)
             maybeEnqueuePtr(packet.dstIp)
         }
 
         return changed
+    }
+
+    private fun seedWellKnownEndpoint(ip: String, timestampMs: Long): Boolean {
+        val label = wellKnownEndpoints[ip] ?: return false
+        return putMappingInternal(
+            ip = ip,
+            rawDomain = label,
+            source = ResolutionSource.WELL_KNOWN,
+            timestampMs = timestampMs,
+            allowMulticast = true
+        )
     }
 
     fun putMapping(
@@ -134,16 +160,17 @@ object DnsResolutionCache {
         ip: String,
         rawDomain: String,
         source: ResolutionSource,
-        timestampMs: Long
+        timestampMs: Long,
+        allowMulticast: Boolean = false
     ): Boolean {
-        if (!isResolvablePublicIp(ip)) return false
+        val resolvable = if (allowMulticast) wellKnownEndpoints.containsKey(ip) else isResolvableAnyIp(ip)
+        if (!resolvable) return false
         val domain = normalizeHostname(rawDomain) ?: return false
         if (domain.equals(ip, ignoreCase = true)) return false
 
         if (cache.size >= MAX_CACHED_HOSTS && !cache.containsKey(ip)) {
-            // Trim oldest PTR entries first if cache grows very large
             val ptrKey = cache.entries
-                .filter { it.value.source == ResolutionSource.REVERSE_PTR }
+                .filter { it.value.source == ResolutionSource.REVERSE_PTR || it.value.source == ResolutionSource.WELL_KNOWN }
                 .minByOrNull { it.value.updatedAtMs }
                 ?.key
                 ?: cache.keys.firstOrNull()
@@ -180,7 +207,7 @@ object DnsResolutionCache {
     }
 
     private fun maybeEnqueuePtr(ip: String) {
-        if (!isResolvablePublicIp(ip)) return
+        if (!isResolvableAnyIp(ip)) return
         if (cache.containsKey(ip)) return
         val now = System.currentTimeMillis()
         val cooldown = lookupCooldownUntil[ip]
@@ -190,39 +217,56 @@ object DnsResolutionCache {
     }
 
     private fun performPtrLookup(ip: String) {
-        if (!autoPtrEnabled || cache.containsKey(ip) || !isResolvablePublicIp(ip)) return
+        if (!autoPtrEnabled || cache.containsKey(ip) || !isResolvableAnyIp(ip)) return
         val protector = socketProtector
-        val resolved = if (protector != null) {
-            queryPtrOverProtectedUdp(ip, protector)
+        val isLanIp = !isResolvablePublicIp(ip)
+
+        val resolved: String? = if (isLanIp) {
+            // Private/LAN IP: try mDNS reverse PTR (224.0.0.251:5353), then system local resolver (router DNS / Android mDNS)
+            queryPtrOverUdp(ip, "224.0.0.251", 5353, protector)
+                ?: systemCanonicalHostLookup(ip)
         } else {
-            runCatching {
-                val host = InetAddress.getByName(ip).canonicalHostName
-                if (host.isNotBlank() && host != ip && !isNumericIp(host)) host else null
-            }.getOrNull()
+            // Public IP: try protected UDP PTR against 8.8.8.8, fallback to 1.1.1.1, then system InetAddress
+            queryPtrOverUdp(ip, "8.8.8.8", 53, protector)
+                ?: queryPtrOverUdp(ip, "1.1.1.1", 53, protector)
+                ?: if (protector == null) systemCanonicalHostLookup(ip) else null
         }
+
         if (!resolved.isNullOrBlank()) {
-            if (putMappingInternal(ip, resolved, ResolutionSource.REVERSE_PTR, System.currentTimeMillis())) {
+            val src = if (isLanIp && resolved.endsWith(".local", ignoreCase = true)) {
+                ResolutionSource.MDNS_LAN
+            } else {
+                ResolutionSource.REVERSE_PTR
+            }
+            if (putMappingInternal(ip, resolved, src, System.currentTimeMillis())) {
                 publishSnapshot()
             }
         }
     }
 
-    private fun queryPtrOverProtectedUdp(
+    private fun systemCanonicalHostLookup(ip: String): String? = runCatching {
+        val host = InetAddress.getByName(ip).canonicalHostName
+        if (host.isNotBlank() && host != ip && !isNumericIp(host)) host else null
+    }.getOrNull()
+
+    private fun queryPtrOverUdp(
         ip: String,
-        protector: (DatagramSocket) -> Boolean
+        dnsServerIp: String,
+        dnsPort: Int,
+        protector: ((DatagramSocket) -> Boolean)?
     ): String? {
-        val txId = txIdCounter.incrementAndGet() and 0xFFFF
+        val txId = if (dnsPort == 5353) 0 else (txIdCounter.incrementAndGet() and 0xFFFF)
         val queryBytes = buildPtrQueryPacket(ip, txId) ?: return null
         return runCatching {
             DatagramSocket().use { socket ->
-                if (!protector(socket)) return@runCatching null
+                if (protector != null && !protector(socket)) return@runCatching null
                 socket.soTimeout = PTR_TIMEOUT_MS
-                val dnsServer = InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8))
-                socket.send(DatagramPacket(queryBytes, queryBytes.size, dnsServer, 53))
-                val buf = ByteArray(512)
+                val dnsServer = InetAddress.getByName(dnsServerIp)
+                socket.send(DatagramPacket(queryBytes, queryBytes.size, dnsServer, dnsPort))
+                val buf = ByteArray(1024)
                 val resp = DatagramPacket(buf, buf.size)
                 socket.receive(resp)
-                parsePtrResponse(buf.copyOf(resp.length), expectedTxId = txId)
+                parsePtrResponse(buf.copyOf(resp.length), expectedTxId = if (dnsPort == 5353) null else txId)
             }
         }.getOrNull()
     }
@@ -302,6 +346,28 @@ object DnsResolutionCache {
         return null
     }
 
+    internal fun isResolvableAnyIp(ip: String): Boolean {
+        if (ip.isBlank() || ip == "—" || ip == "10.1.10.1") return false
+        if (isResolvablePublicIp(ip)) return true
+        if (ip.contains(':')) {
+            val lower = ip.lowercase()
+            return lower != "::" && lower != "::1" && !lower.startsWith("ff")
+        }
+        val parts = ip.split('.')
+        if (parts.size != 4) return false
+        val a = parts[0].toIntOrNull() ?: return false
+        val b = parts[1].toIntOrNull() ?: return false
+        val c = parts[2].toIntOrNull() ?: return false
+        val d = parts[3].toIntOrNull() ?: return false
+        if (a !in 0..255 || b !in 0..255 || c !in 0..255 || d !in 0..255) return false
+        return when {
+            a == 0 -> false
+            a == 127 -> false
+            a >= 224 -> false
+            else -> true
+        }
+    }
+
     internal fun isResolvablePublicIp(ip: String): Boolean {
         if (ip.isBlank() || ip == "—") return false
         if (ip.contains(':')) {
@@ -333,6 +399,19 @@ object DnsResolutionCache {
             else -> true
         }
     }
+
+    private val wellKnownEndpoints = mapOf(
+        "224.0.0.251" to "mdns.mcast.net",
+        "224.0.0.252" to "llmnr.mcast.net",
+        "239.255.255.250" to "ssdp.upnp.mcast.net",
+        "224.0.0.1" to "all-hosts.mcast.net",
+        "224.0.0.2" to "all-routers.mcast.net",
+        "255.255.255.255" to "lan.broadcast",
+        "8.8.8.8" to "dns.google",
+        "8.8.4.4" to "dns.google",
+        "1.1.1.1" to "one.one.one.one",
+        "1.0.0.1" to "one.one.one.one"
+    )
 
     private fun normalizeHostname(raw: String): String? {
         var cleaned = raw.trim().trimEnd('.')

@@ -97,6 +97,8 @@ fun AnalyticsScreen(
         item {
             ActiveConnectionsCard(
                 conversations = conversations.take(6),
+                resolvedDomains = uiState.resolvedDomains,
+                resolveHostnames = uiState.resolveHostnames,
                 onSelectConnection = onSelectConnection
             )
         }
@@ -367,6 +369,8 @@ private fun ProtocolDistributionCard(protocolStats: List<ProtocolStat>) {
 @Composable
 private fun ActiveConnectionsCard(
     conversations: List<ConversationStream>,
+    resolvedDomains: Map<String, ResolvedHost>,
+    resolveHostnames: Boolean,
     onSelectConnection: (ConversationStream) -> Unit
 ) {
     Surface(
@@ -409,8 +413,10 @@ private fun ActiveConnectionsCard(
                             ProtocolBadge(protocol = conn.protocol)
                             CaptureSourceBadge(captureSource = conn.captureSource)
                             Column(modifier = Modifier.weight(1f)) {
+                                val resolvedName = conn.hostLabel
+                                    ?: if (resolveHostnames) resolvedDomains[conn.remoteIp]?.domain else null
                                 Text(
-                                    text = conn.hostLabel ?: conn.remoteEndpoint,
+                                    text = resolvedName ?: conn.remoteEndpoint,
                                     style = MaterialTheme.typography.bodySmall.copy(
                                         fontFamily = MonoFontFamily,
                                         fontWeight = FontWeight.SemiBold

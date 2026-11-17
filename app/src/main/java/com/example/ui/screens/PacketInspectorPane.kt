@@ -196,8 +196,16 @@ fun PacketInspectorPane(
 
                 val src = if (packet.srcPort > 0) "${packet.srcIp}:${packet.srcPort}" else packet.srcIp
                 val dst = if (packet.dstPort > 0) "${packet.dstIp}:${packet.dstPort}" else packet.dstIp
+                val srcHost = if (resolveHostnames) resolvedDomains[packet.srcIp]?.domain else null
+                val dstHost = if (resolveHostnames) resolvedDomains[packet.dstIp]?.domain else null
+                val srcHeader = if (srcHost != null) {
+                    if (packet.srcPort > 0) "$srcHost:${packet.srcPort}" else srcHost
+                } else src
+                val dstHeader = if (dstHost != null) {
+                    if (packet.dstPort > 0) "$dstHost:${packet.dstPort}" else dstHost
+                } else dst
                 Text(
-                    text = "$src  →  $dst",
+                    text = "$srcHeader  →  $dstHeader",
                     style = MaterialTheme.typography.bodyMedium.copy(
                         fontFamily = MonoFontFamily,
                         fontWeight = FontWeight.SemiBold

@@ -56,6 +56,7 @@ import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
 import com.example.model.ConversationStream
 import com.example.model.PacketDirection
+import com.example.model.ResolvedHost
 import com.example.model.TrafficScopeFilter
 import com.example.ui.components.CaptureSourceBadge
 import com.example.ui.components.ProtocolBadge
@@ -68,6 +69,8 @@ import java.nio.charset.StandardCharsets
 @Composable
 fun StreamsScreen(
     streams: List<ConversationStream>,
+    resolvedDomains: Map<String, ResolvedHost> = emptyMap(),
+    resolveHostnames: Boolean = true,
     onSelectStream: (ConversationStream) -> Unit,
     onFilterToStream: (ConversationStream) -> Unit,
     modifier: Modifier = Modifier
@@ -232,6 +235,8 @@ fun StreamsScreen(
                     val isRecent = (nowMs - stream.lastSeenMs) < 15_000L
                     StreamCard(
                         stream = stream,
+                        resolvedDomains = resolvedDomains,
+                        resolveHostnames = resolveHostnames,
                         isActiveRecent = isRecent,
                         onClick = { onSelectStream(stream) },
                         onFilterClick = { onFilterToStream(stream) }
@@ -245,6 +250,8 @@ fun StreamsScreen(
 @Composable
 private fun StreamCard(
     stream: ConversationStream,
+    resolvedDomains: Map<String, ResolvedHost>,
+    resolveHostnames: Boolean,
     isActiveRecent: Boolean,
     onClick: () -> Unit,
     onFilterClick: () -> Unit
@@ -323,9 +330,12 @@ private fun StreamCard(
                 }
             }
 
-            if (!stream.hostLabel.isNullOrBlank()) {
+            val resolvedRemote = if (resolveHostnames) resolvedDomains[stream.remoteIp] else null
+            val displayHost = stream.hostLabel ?: resolvedRemote?.domain
+            if (!displayHost.isNullOrBlank()) {
+                val badge = resolvedRemote?.source?.shortLabel?.let { " [$it]" }.orEmpty()
                 Text(
-                    text = stream.hostLabel,
+                    text = "$displayHost$badge",
                     style = MaterialTheme.typography.titleSmall.copy(fontFamily = MonoFontFamily),
                     color = accent,
                     maxLines = 1,
@@ -373,12 +383,19 @@ private fun StreamCard(
 fun FollowStreamDialog(
     streamKey: String,
     packets: List<CapturedPacket>,
+    resolvedDomains: Map<String, ResolvedHost> = emptyMap(),
+    resolveHostnames: Boolean = true,
     onFilterToStream: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val protoColors = LocalProtocolColors.current
     val payloadPackets = packets.filter { it.payloadLength > 0 }
     val host = packets.firstNotNullOfOrNull { it.hostOrSni }
+        ?: if (resolveHostnames) {
+            packets.firstNotNullOfOrNull {
+                resolvedDomains[it.dstIp]?.domain ?: resolvedDomains[it.srcIp]?.domain
+            }
+        } else null
 
     Dialog(
         onDismissRequest = onDismiss,

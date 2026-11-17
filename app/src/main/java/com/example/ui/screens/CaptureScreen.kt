@@ -40,6 +40,7 @@ import androidx.compose.material.icons.rounded.Layers
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Smartphone
+import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.VerticalAlignBottom
 import androidx.compose.material.icons.rounded.WarningAmber
@@ -84,6 +85,8 @@ import com.example.model.CapturedPacket
 import com.example.model.ProbeType
 import com.example.model.QuickFilter
 import com.example.model.ResolvedHost
+import com.example.model.RootSandboxState
+import com.example.model.RootSandboxStatus
 import com.example.model.TrafficScopeFilter
 import com.example.ui.components.CaptureSourceBadge
 import com.example.ui.components.DirectionPill
@@ -101,6 +104,7 @@ import com.example.viewmodel.CaptureUiState
 @Composable
 fun CaptureScreen(
     uiState: CaptureUiState,
+    rootSandboxState: RootSandboxState = RootSandboxState(),
     probeBusy: Boolean,
     onStartCapture: () -> Unit,
     onOpenPcap: () -> Unit,
@@ -111,6 +115,7 @@ fun CaptureScreen(
     onToggleAutoScroll: () -> Unit,
     onToggleResolveHostnames: () -> Unit,
     onToggleLanMulticast: () -> Unit,
+    onOpenPromiscuousSandbox: () -> Unit = {},
     onSelectPacket: (CapturedPacket) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -161,11 +166,11 @@ fun CaptureScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "• LAN Multicast Listen (MulticastLock): Joins Wi-Fi mDNS (224.0.0.251:5353) and SSDP/UPnP (239.255.255.250:1900) to capture real local discovery broadcasts from nearby printers, routers, TVs, and computers.",
+                        text = "• LAN Multicast Listen (MulticastLock): Joins Wi-Fi mDNS (224.0.0.251:5353), SSDP (239.255.255.250:1900), LLMNR (224.0.0.252:5355), and WS-Discovery (3702) without root.",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
-                        text = "• Android OS Boundary: Standard non-rooted Android kernels block raw wlan0 hardware promiscuous sniffing (AF_PACKET / CAP_NET_RAW), so private unicast frames between other devices on your Wi-Fi cannot be intercepted without root.",
+                        text = "• Root Promiscuous Sandbox: On rooted devices (su + tcpdump), opens a dedicated Wireshark-style raw interface capture (wlan0/any with IFF_PROMISC) directly into the LAN tab.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -319,7 +324,9 @@ fun CaptureScreen(
             enabled = uiState.lanMulticastEnabled,
             active = uiState.lanMulticastActive,
             lanPacketCount = uiState.lanPacketCount,
+            rootSandboxState = rootSandboxState,
             onToggle = onToggleLanMulticast,
+            onOpenSandbox = onOpenPromiscuousSandbox,
             onShowInfo = { showPromiscuousInfo = true }
         )
 
@@ -346,6 +353,7 @@ fun CaptureScreen(
                 onStartCapture = onStartCapture,
                 onOpenPcap = onOpenPcap,
                 onRunProbe = onRunProbe,
+                onOpenPromiscuousSandbox = onOpenPromiscuousSandbox,
                 onResetScope = { onTrafficScopeSelected(TrafficScopeFilter.ALL) },
                 onResetFilters = {
                     onTrafficScopeSelected(TrafficScopeFilter.ALL)
@@ -791,6 +799,7 @@ private fun EmptyCaptureView(
     onStartCapture: () -> Unit,
     onOpenPcap: () -> Unit,
     onRunProbe: (ProbeType) -> Unit,
+    onOpenPromiscuousSandbox: () -> Unit,
     onResetScope: () -> Unit,
     onResetFilters: () -> Unit,
     modifier: Modifier = Modifier
@@ -832,11 +841,22 @@ private fun EmptyCaptureView(
                         textAlign = TextAlign.Center
                     )
                     Text(
-                        text = "This lane isolates Wi-Fi LAN multicast discovery traffic (mDNS & SSDP on wlan0) cleanly from your phone's tun0 traffic ($phonePacketCount phone packets buffered).",
+                        text = "This lane isolates LAN multicast discovery (mDNS, SSDP, LLMNR) and rooted raw tcpdump frames cleanly from your phone's tun0 traffic ($phonePacketCount phone packets buffered).",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.88f),
                         textAlign = TextAlign.Center
                     )
+                    OutlinedButton(
+                        onClick = onOpenPromiscuousSandbox,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("empty_open_sandbox_button")
+                    ) {
+                        Icon(Icons.Rounded.Terminal, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Open Promiscuous Sandbox (Root / LAN)")
+                    }
                     OutlinedButton(
                         onClick = { onRunProbe(ProbeType.LAN_DISCOVERY) },
                         enabled = !probeBusy,
@@ -1038,29 +1058,33 @@ private fun LanMulticastStrip(
     enabled: Boolean,
     active: Boolean,
     lanPacketCount: Long,
+    rootSandboxState: RootSandboxState,
     onToggle: () -> Unit,
+    onOpenSandbox: () -> Unit,
     onShowInfo: () -> Unit
 ) {
-    val activeAccent = if (active) WarmGoldLive else MaterialTheme.colorScheme.primary
+    val rootRunning = rootSandboxState.status == RootSandboxStatus.ROOT_RUNNING
+    val anyActive = enabled || rootRunning
+    val activeAccent = if (active || rootRunning) WarmGoldLive else MaterialTheme.colorScheme.primary
     Surface(
         shape = RoundedCornerShape(12.dp),
-        color = if (enabled) {
+        color = if (anyActive) {
             MaterialTheme.colorScheme.surfaceContainerHigh
         } else {
             MaterialTheme.colorScheme.surfaceContainerLow
         },
         border = BorderStroke(
             1.dp,
-            if (enabled) activeAccent.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outlineVariant
+            if (anyActive) activeAccent.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outlineVariant
         ),
         modifier = Modifier.fillMaxWidth()
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 10.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+                .padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1076,26 +1100,26 @@ private fun LanMulticastStrip(
                 Icon(
                     imageVector = Icons.Rounded.WifiTethering,
                     contentDescription = "Toggle LAN Multicast promiscuous listener",
-                    tint = if (enabled) activeAccent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = if (anyActive) activeAccent else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(18.dp)
                 )
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (enabled) {
-                            "Promiscuous LAN Listen: ON ($lanPacketCount LAN pkts)"
-                        } else {
-                            "Promiscuous LAN Listen (mDNS + SSDP)"
+                        text = when {
+                            rootRunning -> "Root Sandbox: ${rootSandboxState.selectedInterface} (${rootSandboxState.capturedFrames} frames)"
+                            enabled -> "Promiscuous LAN: ON ($lanPacketCount LAN pkts)"
+                            else -> "Promiscuous LAN Listen"
                         },
                         style = MaterialTheme.typography.labelLarge,
-                        color = if (enabled) activeAccent else MaterialTheme.colorScheme.onSurface,
+                        color = if (anyActive) activeAccent else MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = if (active) {
-                            "WifiManager.MulticastLock active on 224.0.0.251 & 239.255.255.250"
-                        } else {
-                            "Tap to listen to local Wi-Fi mDNS & SSDP broadcasts"
+                        text = when {
+                            rootRunning -> "Root tcpdump streaming raw frames + Multicast"
+                            active -> "MulticastLock active (mDNS, SSDP, LLMNR, WSD)"
+                            else -> "Tap to listen or open Root Sandbox"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1103,6 +1127,20 @@ private fun LanMulticastStrip(
                         overflow = TextOverflow.Ellipsis
                     )
                 }
+            }
+            OutlinedButton(
+                onClick = onOpenSandbox,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .heightIn(min = 40.dp)
+                    .testTag("open_promiscuous_sandbox_button")
+            ) {
+                Icon(Icons.Rounded.Terminal, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "Sandbox",
+                    style = MaterialTheme.typography.labelMedium
+                )
             }
             IconButton(
                 onClick = onShowInfo,

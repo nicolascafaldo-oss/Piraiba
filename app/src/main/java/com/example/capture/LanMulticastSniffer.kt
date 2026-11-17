@@ -34,6 +34,10 @@ object LanMulticastSniffer {
     const val MDNS_PORT = 5353
     const val SSDP_GROUP = "239.255.255.250"
     const val SSDP_PORT = 1900
+    const val LLMNR_GROUP = "224.0.0.252"
+    const val LLMNR_PORT = 5355
+    const val WSD_PORT = 3702
+    const val NBNS_PORT = 137
 
     private val running = AtomicBoolean(false)
     private val ipIdSeq = AtomicInteger(1000)
@@ -45,10 +49,8 @@ object LanMulticastSniffer {
     val lanPacketCount: StateFlow<Long> = _lanPacketCount.asStateFlow()
 
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var mdnsSocket: MulticastSocket? = null
-    private var ssdpSocket: MulticastSocket? = null
-    private var mdnsThread: Thread? = null
-    private var ssdpThread: Thread? = null
+    private val activeSockets = mutableListOf<DatagramSocket>()
+    private val listenerThreads = mutableListOf<Thread>()
     @Volatile
     private var activeProtector: ((DatagramSocket) -> Boolean)? = null
 
@@ -73,15 +75,33 @@ object LanMulticastSniffer {
         }
 
         _isListening.value = true
-        mdnsThread = Thread(
-            { runGroupListener(MDNS_GROUP, MDNS_PORT, socketProtector) { mdnsSocket = it } },
-            "Piraiba-LAN-mDNS"
-        ).apply { start() }
+        synchronized(listenerThreads) {
+            listenerThreads.clear()
+            listenerThreads += Thread(
+                { runGroupListener(MDNS_GROUP, MDNS_PORT, socketProtector) },
+                "Piraiba-LAN-mDNS"
+            ).apply { start() }
 
-        ssdpThread = Thread(
-            { runGroupListener(SSDP_GROUP, SSDP_PORT, socketProtector) { ssdpSocket = it } },
-            "Piraiba-LAN-SSDP"
-        ).apply { start() }
+            listenerThreads += Thread(
+                { runGroupListener(SSDP_GROUP, SSDP_PORT, socketProtector) },
+                "Piraiba-LAN-SSDP"
+            ).apply { start() }
+
+            listenerThreads += Thread(
+                { runGroupListener(LLMNR_GROUP, LLMNR_PORT, socketProtector) },
+                "Piraiba-LAN-LLMNR"
+            ).apply { start() }
+
+            listenerThreads += Thread(
+                { runGroupListener(SSDP_GROUP, WSD_PORT, socketProtector) },
+                "Piraiba-LAN-WSD"
+            ).apply { start() }
+
+            listenerThreads += Thread(
+                { runUdpBroadcastListener(NBNS_PORT, socketProtector) },
+                "Piraiba-LAN-NBNS"
+            ).apply { start() }
+        }
     }
 
     fun restartIfRunning(
@@ -101,14 +121,14 @@ object LanMulticastSniffer {
         if (resetCount) {
             _lanPacketCount.value = 0L
         }
-        runCatching { mdnsSocket?.close() }
-        runCatching { ssdpSocket?.close() }
-        mdnsSocket = null
-        ssdpSocket = null
-        mdnsThread?.interrupt()
-        ssdpThread?.interrupt()
-        mdnsThread = null
-        ssdpThread = null
+        synchronized(activeSockets) {
+            activeSockets.forEach { sock -> runCatching { sock.close() } }
+            activeSockets.clear()
+        }
+        synchronized(listenerThreads) {
+            listenerThreads.forEach { it.interrupt() }
+            listenerThreads.clear()
+        }
         runCatching {
             if (multicastLock?.isHeld == true) {
                 multicastLock?.release()
@@ -122,14 +142,15 @@ object LanMulticastSniffer {
     }
 
     /**
-     * Sends a real mDNS PTR (_services._dns-sd._udp.local) and SSDP M-SEARCH multicast
-     * query directly on local Wi-Fi interfaces to elicit live LAN device announcements.
+     * Sends real mDNS PTR (_services._dns-sd._udp.local & _http._tcp.local) and
+     * SSDP M-SEARCH multicast queries on local Wi-Fi interfaces to elicit live LAN responses.
      */
     fun sendDiscoverySweep(socketProtector: ((DatagramSocket) -> Boolean)? = activeProtector): String {
         val lanInterfaces = findMulticastInterfaces()
         var sentCount = 0
 
-        val mdnsQuery = buildMdnsServicesQuery()
+        val mdnsServicesQuery = buildMdnsPtrQuery(listOf("_services", "_dns-sd", "_udp", "local"))
+        val mdnsHttpQuery = buildMdnsPtrQuery(listOf("_http", "_tcp", "local"))
         val ssdpQuery = (
             "M-SEARCH * HTTP/1.1\r\n" +
                 "HOST: 239.255.255.250:1900\r\n" +
@@ -146,7 +167,11 @@ object LanMulticastSniffer {
             sock.timeToLive = 255
             if (lanInterfaces.isEmpty()) {
                 runCatching {
-                    sock.send(DatagramPacket(mdnsQuery, mdnsQuery.size, mdnsGroup, MDNS_PORT))
+                    sock.send(DatagramPacket(mdnsServicesQuery, mdnsServicesQuery.size, mdnsGroup, MDNS_PORT))
+                    sentCount++
+                }
+                runCatching {
+                    sock.send(DatagramPacket(mdnsHttpQuery, mdnsHttpQuery.size, mdnsGroup, MDNS_PORT))
                     sentCount++
                 }
                 runCatching {
@@ -157,7 +182,12 @@ object LanMulticastSniffer {
                 for (netIf in lanInterfaces) {
                     runCatching {
                         sock.networkInterface = netIf
-                        sock.send(DatagramPacket(mdnsQuery, mdnsQuery.size, mdnsGroup, MDNS_PORT))
+                        sock.send(DatagramPacket(mdnsServicesQuery, mdnsServicesQuery.size, mdnsGroup, MDNS_PORT))
+                        sentCount++
+                    }
+                    runCatching {
+                        sock.networkInterface = netIf
+                        sock.send(DatagramPacket(mdnsHttpQuery, mdnsHttpQuery.size, mdnsGroup, MDNS_PORT))
                         sentCount++
                     }
                     runCatching {
@@ -179,8 +209,7 @@ object LanMulticastSniffer {
     private fun runGroupListener(
         groupIp: String,
         port: Int,
-        socketProtector: ((DatagramSocket) -> Boolean)?,
-        registerSocket: (MulticastSocket) -> Unit
+        socketProtector: ((DatagramSocket) -> Boolean)?
     ) {
         var socket: MulticastSocket? = null
         try {
@@ -191,7 +220,7 @@ object LanMulticastSniffer {
                 bind(InetSocketAddress(port))
             }
             socketProtector?.invoke(socket)
-            registerSocket(socket)
+            synchronized(activeSockets) { activeSockets.add(socket) }
 
             val interfaces = findMulticastInterfaces()
             var joinedAny = false
@@ -235,9 +264,65 @@ object LanMulticastSniffer {
                 }
             }
         } catch (_: Exception) {
-            // Closed or network unavailable
+            // Port restricted by OS, closed, or network unavailable
         } finally {
-            runCatching { socket?.close() }
+            if (socket != null) {
+                synchronized(activeSockets) { activeSockets.remove(socket) }
+                runCatching { socket.close() }
+            }
+        }
+    }
+
+    private fun runUdpBroadcastListener(
+        port: Int,
+        socketProtector: ((DatagramSocket) -> Boolean)?
+    ) {
+        var socket: DatagramSocket? = null
+        try {
+            socket = DatagramSocket(null).apply {
+                reuseAddress = true
+                broadcast = true
+                soTimeout = 1000
+                bind(InetSocketAddress(port))
+            }
+            socketProtector?.invoke(socket)
+            synchronized(activeSockets) { activeSockets.add(socket) }
+
+            val buf = ByteArray(2048)
+            val broadcastIpBytes = byteArrayOf(255.toByte(), 255.toByte(), 255.toByte(), 255.toByte())
+            while (running.get() && !socket.isClosed) {
+                val packet = DatagramPacket(buf, buf.size)
+                try {
+                    socket.receive(packet)
+                    val senderAddr = packet.address as? Inet4Address ?: continue
+                    val len = packet.length
+                    if (len <= 0) continue
+                    val payload = packet.data.copyOfRange(packet.offset, packet.offset + len)
+                    val frame = buildLanUdpFrame(
+                        srcIp = senderAddr.address,
+                        dstIp = broadcastIpBytes,
+                        srcPort = packet.port,
+                        dstPort = port,
+                        payload = payload,
+                        ipId = ipIdSeq.getAndIncrement() and 0xFFFF
+                    )
+                    _lanPacketCount.value = _lanPacketCount.value + 1L
+                    CaptureRepository.recordRawPacket(
+                        rawBytes = frame,
+                        direction = PacketDirection.INBOUND,
+                        captureSource = CaptureSource.LAN_PROMISCUOUS
+                    )
+                } catch (_: SocketTimeoutException) {
+                    // Poll check
+                }
+            }
+        } catch (_: Exception) {
+            // Privileged port (<1024) on stock non-root Android or closed cleanly
+        } finally {
+            if (socket != null) {
+                synchronized(activeSockets) { activeSockets.remove(socket) }
+                runCatching { socket.close() }
+            }
         }
     }
 
@@ -246,6 +331,10 @@ object LanMulticastSniffer {
         val all = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull() ?: return emptyList()
         while (all.hasMoreElements()) {
             val ni = all.nextElement()
+            val nameLower = ni.name.lowercase()
+            if (nameLower.startsWith("tun") || nameLower.startsWith("ppp") || nameLower.startsWith("rmnet")) {
+                continue
+            }
             val usable = runCatching {
                 ni.isUp && !ni.isLoopback && !ni.isPointToPoint && ni.supportsMulticast() &&
                     ni.inetAddresses.asSequence().any { it is Inet4Address }
@@ -302,7 +391,7 @@ object LanMulticastSniffer {
         return pkt
     }
 
-    private fun buildMdnsServicesQuery(): ByteArray {
+    private fun buildMdnsPtrQuery(labels: List<String>): ByteArray {
         val out = ByteArrayOutputStream()
         out.write(0x00); out.write(0x00) // mDNS Transaction ID = 0
         out.write(0x00); out.write(0x00) // Standard Query
@@ -310,7 +399,7 @@ object LanMulticastSniffer {
         out.write(0x00); out.write(0x00)
         out.write(0x00); out.write(0x00)
         out.write(0x00); out.write(0x00)
-        for (label in listOf("_services", "_dns-sd", "_udp", "local")) {
+        for (label in labels) {
             val bytes = label.toByteArray(StandardCharsets.US_ASCII)
             out.write(bytes.size)
             out.write(bytes)

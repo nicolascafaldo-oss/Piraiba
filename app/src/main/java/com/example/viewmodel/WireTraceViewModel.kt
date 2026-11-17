@@ -11,6 +11,7 @@ import com.example.capture.AlertMonitor
 import com.example.capture.CaptureRepository
 import com.example.capture.DnsResolutionCache
 import com.example.capture.LanMulticastSniffer
+import com.example.capture.RootPromiscuousSniffer
 import com.example.dissector.DisplayFilterParser
 import com.example.dissector.ParsedDisplayFilter
 import com.example.dissector.PcapCodec
@@ -26,6 +27,7 @@ import com.example.model.ProtocolStat
 import com.example.model.ProtocolType
 import com.example.model.QuickFilter
 import com.example.model.ResolvedHost
+import com.example.model.RootSandboxState
 import com.example.model.ThroughputPoint
 import com.example.model.TrafficScopeFilter
 import kotlinx.coroutines.Dispatchers
@@ -85,6 +87,7 @@ class WireTraceViewModel : ViewModel() {
     val alertEvents: StateFlow<List<NetworkAlertEvent>> = AlertMonitor.alerts
     val unreadAlertCount: StateFlow<Int> = AlertMonitor.unreadCount
     val latestAlertEvent: StateFlow<NetworkAlertEvent?> = AlertMonitor.latestAlert
+    val rootSandboxState: StateFlow<RootSandboxState> = RootPromiscuousSniffer.state
 
     fun bindAlertStore(context: Context) {
         if (alertStoreBound) return
@@ -341,10 +344,35 @@ class WireTraceViewModel : ViewModel() {
         val next = !CaptureRepository.lanMulticastEnabled.value
         CaptureRepository.setLanMulticastEnabled(context.applicationContext, next)
         _toastEvent.value = if (next) {
-            "LAN Multicast Listen active (mDNS 224.0.0.251 & SSDP 239.255.255.250)"
+            "LAN Multicast Listen active (mDNS, SSDP, LLMNR, WS-Discovery)"
         } else {
             "LAN Multicast Listen turned off"
         }
+    }
+
+    fun probeRootSandbox() {
+        RootPromiscuousSniffer.probeSandbox()
+    }
+
+    fun setRootSandboxInterface(iface: String) {
+        RootPromiscuousSniffer.setSelectedInterface(iface)
+    }
+
+    fun setRootSandboxBpfFilter(filter: String) {
+        RootPromiscuousSniffer.setBpfFilter(filter)
+    }
+
+    fun setRootSandboxPromiscuous(enabled: Boolean) {
+        RootPromiscuousSniffer.setPromiscuousMode(enabled)
+    }
+
+    fun startRootSandboxCapture() {
+        _trafficScopeFilter.value = TrafficScopeFilter.ALL
+        RootPromiscuousSniffer.startCapture()
+    }
+
+    fun stopRootSandboxCapture() {
+        RootPromiscuousSniffer.stopCapture()
     }
 
     fun filterToStream(stream: ConversationStream) {

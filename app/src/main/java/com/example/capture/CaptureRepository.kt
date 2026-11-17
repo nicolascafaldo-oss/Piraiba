@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.dissector.PacketDissector
 import com.example.model.CaptureSource
 import com.example.model.CapturedPacket
+import com.example.model.LinkLayerType
 import com.example.model.PacketDirection
 import com.example.model.ProbeType
 import com.example.model.ThroughputPoint
@@ -156,7 +157,8 @@ object CaptureRepository {
     fun recordRawPacket(
         rawBytes: ByteArray,
         direction: PacketDirection,
-        captureSource: CaptureSource = CaptureSource.DEVICE_VPN
+        captureSource: CaptureSource = CaptureSource.DEVICE_VPN,
+        linkLayerType: LinkLayerType = LinkLayerType.RAW_TUN
     ) {
         if (rawBytes.isEmpty()) return
         val now = System.currentTimeMillis()
@@ -170,6 +172,7 @@ object CaptureRepository {
             timestampMs = now,
             relativeTimeMs = relMs,
             direction = direction,
+            linkLayerType = linkLayerType,
             captureSource = captureSource
         )
 

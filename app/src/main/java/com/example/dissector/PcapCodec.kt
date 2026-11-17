@@ -10,7 +10,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Standard libpcap (.pcap) binary encoder & decoder supporting LINKTYPE_RAW (101) and LINKTYPE_ETHERNET (1).
+ * Standard libpcap (.pcap) binary encoder & decoder supporting LINKTYPE_RAW (101),
+ * LINKTYPE_ETHERNET (1), LINKTYPE_LINUX_SLL (113), and LINKTYPE_LINUX_SLL2 (276).
  * Exported files open natively in desktop Wireshark, tcpdump, and tshark.
  */
 object PcapCodec {
@@ -19,6 +20,22 @@ object PcapCodec {
     private const val PCAP_MAGIC_BE = 0xD4C3B2A1.toInt()
     const val LINKTYPE_ETHERNET = 1
     const val LINKTYPE_RAW = 101
+    const val LINKTYPE_LINUX_SLL = 113
+    const val LINKTYPE_LINUX_SLL2 = 276
+
+    fun linkLayerForPcapType(linkType: Int): LinkLayerType = when (linkType) {
+        LINKTYPE_ETHERNET -> LinkLayerType.ETHERNET
+        LINKTYPE_LINUX_SLL -> LinkLayerType.LINUX_SLL
+        LINKTYPE_LINUX_SLL2 -> LinkLayerType.LINUX_SLL2
+        else -> LinkLayerType.RAW_TUN
+    }
+
+    fun ipHeaderOffset(linkLayerType: LinkLayerType): Int = when (linkLayerType) {
+        LinkLayerType.ETHERNET -> 14
+        LinkLayerType.LINUX_SLL -> 16
+        LinkLayerType.LINUX_SLL2 -> 20
+        LinkLayerType.RAW_TUN -> 0
+    }
 
     fun writePcap(packets: List<CapturedPacket>, outputStream: OutputStream) {
         val allEthernet = packets.isNotEmpty() && packets.all { it.linkLayerType == LinkLayerType.ETHERNET }
@@ -38,8 +55,9 @@ object PcapCodec {
 
         val pktHeaderBuf = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
         for (pkt in packets) {
-            val payloadBytes = if (linkType == LINKTYPE_RAW && pkt.linkLayerType == LinkLayerType.ETHERNET && pkt.rawBytes.size > 14) {
-                pkt.rawBytes.copyOfRange(14, pkt.rawBytes.size)
+            val stripLen = ipHeaderOffset(pkt.linkLayerType)
+            val payloadBytes = if (linkType == LINKTYPE_RAW && stripLen > 0 && pkt.rawBytes.size > stripLen) {
+                pkt.rawBytes.copyOfRange(stripLen, pkt.rawBytes.size)
             } else {
                 pkt.rawBytes
             }
@@ -70,7 +88,7 @@ object PcapCodec {
         val headerBuf = ByteBuffer.wrap(allBytes, 0, 24).order(order)
         headerBuf.position(20)
         val linkType = headerBuf.int
-        val dissectorLinkType = if (linkType == LINKTYPE_ETHERNET) LinkLayerType.ETHERNET else LinkLayerType.RAW_TUN
+        val dissectorLinkType = linkLayerForPcapType(linkType)
 
         var cursor = 24
         var seqId = 1L
@@ -93,7 +111,7 @@ object PcapCodec {
             val tsMs = tsSec * 1000L + tsUsec / 1000L
             if (seqId == 1L) firstTimestampMs = tsMs
 
-            val ipOffset = if (dissectorLinkType == LinkLayerType.ETHERNET) 14 else 0
+            val ipOffset = ipHeaderOffset(dissectorLinkType)
             val dir = if (rawSlice.size >= ipOffset + 20 && (rawSlice[ipOffset].toInt() ushr 4) == 4) {
                 val srcFirst = rawSlice[ipOffset + 12].toInt() and 0xFF
                 if (srcFirst == 10 || srcFirst == 192 || srcFirst == 172) PacketDirection.OUTBOUND else PacketDirection.INBOUND
