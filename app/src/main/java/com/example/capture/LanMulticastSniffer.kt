@@ -42,6 +42,14 @@ object LanMulticastSniffer {
     private val running = AtomicBoolean(false)
     private val ipIdSeq = AtomicInteger(1000)
 
+    /**
+     * Incremented on every start() and stop(). Listener threads capture the generation they
+     * were started with and exit as soon as it changes — without this, a stop() racing a
+     * not-yet-bound listener thread (or restartIfRunning's stop→start) lets the straggler
+     * observe running=true again and keep a duplicate socket alive forever.
+     */
+    private val generation = AtomicInteger(0)
+
     private val _isListening = MutableStateFlow(false)
     val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
 
@@ -62,6 +70,7 @@ object LanMulticastSniffer {
         if (!running.compareAndSet(false, true)) {
             return
         }
+        val gen = generation.incrementAndGet()
 
         runCatching {
             val wifiManager = context.applicationContext.getSystemService(WifiManager::class.java)
@@ -78,27 +87,27 @@ object LanMulticastSniffer {
         synchronized(listenerThreads) {
             listenerThreads.clear()
             listenerThreads += Thread(
-                { runGroupListener(MDNS_GROUP, MDNS_PORT, socketProtector) },
+                { runGroupListener(MDNS_GROUP, MDNS_PORT, socketProtector, gen) },
                 "Piraiba-LAN-mDNS"
             ).apply { start() }
 
             listenerThreads += Thread(
-                { runGroupListener(SSDP_GROUP, SSDP_PORT, socketProtector) },
+                { runGroupListener(SSDP_GROUP, SSDP_PORT, socketProtector, gen) },
                 "Piraiba-LAN-SSDP"
             ).apply { start() }
 
             listenerThreads += Thread(
-                { runGroupListener(LLMNR_GROUP, LLMNR_PORT, socketProtector) },
+                { runGroupListener(LLMNR_GROUP, LLMNR_PORT, socketProtector, gen) },
                 "Piraiba-LAN-LLMNR"
             ).apply { start() }
 
             listenerThreads += Thread(
-                { runGroupListener(SSDP_GROUP, WSD_PORT, socketProtector) },
+                { runGroupListener(SSDP_GROUP, WSD_PORT, socketProtector, gen) },
                 "Piraiba-LAN-WSD"
             ).apply { start() }
 
             listenerThreads += Thread(
-                { runUdpBroadcastListener(NBNS_PORT, socketProtector) },
+                { runUdpBroadcastListener(NBNS_PORT, socketProtector, gen) },
                 "Piraiba-LAN-NBNS"
             ).apply { start() }
         }
@@ -117,6 +126,9 @@ object LanMulticastSniffer {
 
     fun stop(resetCount: Boolean = false) {
         running.set(false)
+        // Invalidate any listener thread that hasn't bound its socket yet: it would
+        // otherwise survive the socket sweep below and re-enter the receive loop.
+        generation.incrementAndGet()
         _isListening.value = false
         if (resetCount) {
             _lanPacketCount.value = 0L
@@ -163,7 +175,12 @@ object LanMulticastSniffer {
         val ssdpGroup = InetAddress.getByName(SSDP_GROUP)
 
         MulticastSocket().use { sock ->
-            socketProtector?.invoke(sock)
+            val protectedOk = socketProtector?.invoke(sock) ?: true
+            if (!protectedOk) {
+                // Sending from an unprotected socket while the VPN is up would route these
+                // probes back into the TUN (recapture loop). Refuse rather than loop.
+                return "LAN sweep skipped: VPN could not protect the discovery socket"
+            }
             sock.timeToLive = 255
             if (lanInterfaces.isEmpty()) {
                 runCatching {
@@ -209,17 +226,25 @@ object LanMulticastSniffer {
     private fun runGroupListener(
         groupIp: String,
         port: Int,
-        socketProtector: ((DatagramSocket) -> Boolean)?
+        socketProtector: ((DatagramSocket) -> Boolean)?,
+        generation: Int
     ) {
         var socket: MulticastSocket? = null
         try {
+            if (this.generation.get() != generation || !running.get()) return
             val groupAddr = InetAddress.getByName(groupIp)
             socket = MulticastSocket(null).apply {
                 reuseAddress = true
                 soTimeout = 1000
                 bind(InetSocketAddress(port))
             }
-            socketProtector?.invoke(socket)
+            // protect() must not be ignored: an unprotected socket bound while the VPN is
+            // up participates in the TUN routing domain (and sends go back through capture).
+            val protectedOk = socketProtector?.invoke(socket) ?: true
+            if (!protectedOk) {
+                reportListenerDeath(port, "VPN protect() refused the socket; not listening")
+                return
+            }
             synchronized(activeSockets) { activeSockets.add(socket) }
 
             val interfaces = findMulticastInterfaces()
@@ -237,7 +262,7 @@ object LanMulticastSniffer {
 
             val buf = ByteArray(4096)
             val dstIpBytes = groupAddr.address
-            while (running.get() && !socket.isClosed) {
+            while (running.get() && generation == this.generation.get() && !socket.isClosed) {
                 val packet = DatagramPacket(buf, buf.size)
                 try {
                     socket.receive(packet)
@@ -263,8 +288,13 @@ object LanMulticastSniffer {
                     // Periodic poll check for clean shutdown
                 }
             }
-        } catch (_: Exception) {
-            // Port restricted by OS, closed, or network unavailable
+        } catch (e: Exception) {
+            // Port restricted by OS, closed, or network unavailable. Only surface this
+            // when the listener died on its own — shutdown races close the socket under
+            // us and are expected.
+            if (running.get() && this.generation.get() == generation) {
+                reportListenerDeath(port, e.message ?: e.javaClass.simpleName)
+            }
         } finally {
             if (socket != null) {
                 synchronized(activeSockets) { activeSockets.remove(socket) }
@@ -275,22 +305,28 @@ object LanMulticastSniffer {
 
     private fun runUdpBroadcastListener(
         port: Int,
-        socketProtector: ((DatagramSocket) -> Boolean)?
+        socketProtector: ((DatagramSocket) -> Boolean)?,
+        generation: Int
     ) {
         var socket: DatagramSocket? = null
         try {
+            if (this.generation.get() != generation || !running.get()) return
             socket = DatagramSocket(null).apply {
                 reuseAddress = true
                 broadcast = true
                 soTimeout = 1000
                 bind(InetSocketAddress(port))
             }
-            socketProtector?.invoke(socket)
+            val protectedOk = socketProtector?.invoke(socket) ?: true
+            if (!protectedOk) {
+                reportListenerDeath(port, "VPN protect() refused the socket; not listening")
+                return
+            }
             synchronized(activeSockets) { activeSockets.add(socket) }
 
             val buf = ByteArray(2048)
             val broadcastIpBytes = byteArrayOf(255.toByte(), 255.toByte(), 255.toByte(), 255.toByte())
-            while (running.get() && !socket.isClosed) {
+            while (running.get() && generation == this.generation.get() && !socket.isClosed) {
                 val packet = DatagramPacket(buf, buf.size)
                 try {
                     socket.receive(packet)
@@ -316,14 +352,26 @@ object LanMulticastSniffer {
                     // Poll check
                 }
             }
-        } catch (_: Exception) {
-            // Privileged port (<1024) on stock non-root Android or closed cleanly
+        } catch (e: Exception) {
+            // Privileged port (<1024) on stock non-root Android or closed cleanly.
+            // Report genuine self-death so a silently dead listener isn't mistaken
+            // for an active capture.
+            if (running.get() && this.generation.get() == generation) {
+                reportListenerDeath(port, e.message ?: e.javaClass.simpleName)
+            }
         } finally {
             if (socket != null) {
                 synchronized(activeSockets) { activeSockets.remove(socket) }
                 runCatching { socket.close() }
             }
         }
+    }
+
+    private fun reportListenerDeath(port: Int, reason: String) {
+        CaptureRepository.postStatus(
+            "LAN listen on port $port stopped: $reason",
+            isError = true
+        )
     }
 
     private fun findMulticastInterfaces(): List<NetworkInterface> {

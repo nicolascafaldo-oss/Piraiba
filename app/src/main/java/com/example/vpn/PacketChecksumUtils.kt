@@ -7,6 +7,11 @@ package com.example.vpn
 object PacketChecksumUtils {
 
     fun computeIpv4Checksum(packet: ByteArray, offset: Int = 0, ihl: Int): Int {
+        // Bounds guard: callers live on the capture/selector threads where an
+        // ArrayIndexOutOfBoundsException would kill packet processing. A short buffer is a
+        // caller bug; return 0 (an invalid checksum — the packet gets dropped downstream)
+        // instead of throwing.
+        if (offset < 0 || ihl < 20 || offset + ihl > packet.size) return 0
         var sum = 0L
         var i = offset
         val end = offset + ihl
@@ -24,6 +29,9 @@ object PacketChecksumUtils {
     }
 
     fun updateIpv4Checksum(packet: ByteArray, offset: Int = 0, ihl: Int) {
+        // Mirror compute()'s bounds guard: compute returns 0 on a short buffer, but writing
+        // the field at offset+10/11 would still throw — and callers run on capture threads.
+        if (offset < 0 || ihl < 20 || offset + 11 >= packet.size) return
         val csum = computeIpv4Checksum(packet, offset, ihl)
         packet[offset + 10] = ((csum ushr 8) and 0xFF).toByte()
         packet[offset + 11] = (csum and 0xFF).toByte()
@@ -36,6 +44,8 @@ object PacketChecksumUtils {
         protocol: Int,
         transportLen: Int
     ) {
+        // Pseudo-header reads below touch ipOffset+12..ipOffset+17 — guard them.
+        if (ipOffset < 0 || ipOffset + 20 > packet.size) return
         val l4Offset = ipOffset + ihl
         val checksumFieldOffset = when (protocol) {
             6 -> l4Offset + 16 // TCP checksum

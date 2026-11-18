@@ -346,6 +346,34 @@ object PacketDissector {
 
         val l4Offset = l3Offset + ihl
         val ipEnd = (l3Offset + totalLen).coerceAtLeast(l4Offset)
+        if (fragOffset != 0) {
+            // Non-first fragment: there is NO transport header at l4Offset. Parsing L4/DNS/HTTP
+            // out of fragment payload fabricates ports and flags, feeds AlertMonitor phantom
+            // SYNs, and can write bogus IP↔domain mappings into DnsResolutionCache. Show it as
+            // a raw fragment instead (what Wireshark does).
+            return CapturedPacket(
+                id = id,
+                timestampMs = timestampMs,
+                relativeTimeMs = relativeTimeMs,
+                direction = direction,
+                ipVersion = 4,
+                srcIp = srcIp,
+                dstIp = dstIp,
+                srcPort = 0,
+                dstPort = 0,
+                transportProtocol = "IP/$protoNum",
+                protocol = ProtocolType.OTHER,
+                length = raw.size,
+                hostOrSni = null,
+                infoSummary = "IPv4 fragment (offset=$fragOffset, ${raw.size} bytes)",
+                tcpFlags = 0,
+                payloadOffset = l4Offset,
+                payloadLength = (ipEnd - l4Offset).coerceAtLeast(0),
+                rawBytes = raw,
+                layers = layers,
+                linkLayerType = linkLayerType
+            )
+        }
         return dissectTransport(
             id = id,
             raw = raw,

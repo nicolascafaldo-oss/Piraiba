@@ -223,6 +223,70 @@ class PacketDissectorTest {
         assertFalse(DisplayFilterParser.parse("github", QuickFilter.ALL, emptyMap()).matches(pkt))
     }
 
+    @Test
+    fun doesNotDissectTransportHeadersOutOfNonFirstFragments() {
+        val raw = buildIpv4Tcp(
+            srcIp = byteArrayOf(10, 1, 10, 1),
+            dstIp = byteArrayOf(1, 1, 1, 1),
+            srcPort = 50000,
+            dstPort = 443,
+            flags = PacketDissector.TCP_FLAG_SYN,
+            payload = ByteArray(0)
+        )
+        // Mark as a non-first fragment (fragOffset = 185 -> 1480 bytes in). There is no
+        // transport header at l4Offset for such a packet, so ports/flags read from there
+        // would be payload bytes: phantom TCP sessions, bogus AlertMonitor SYNs, and
+        // (for UDP fragments) poisoned DnsResolutionCache entries.
+        raw[6] = 0x00
+        raw[7] = 185.toByte()
+
+        val pkt = PacketDissector.dissect(9L, raw, 1_700_000_000_000L, 0L, PacketDirection.OUTBOUND)
+        assertEquals(ProtocolType.OTHER, pkt.protocol)
+        assertEquals(0, pkt.srcPort)
+        assertEquals(0, pkt.dstPort)
+        assertTrue(pkt.infoSummary.contains("fragment"))
+        assertFalse(DisplayFilterParser.parse("tcp", QuickFilter.ALL).matches(pkt))
+
+        // First fragment (offset 0, MF set) DOES carry the transport header — still dissected.
+        val firstFrag = buildIpv4Tcp(
+            srcIp = byteArrayOf(10, 1, 10, 1),
+            dstIp = byteArrayOf(1, 1, 1, 1),
+            srcPort = 50000,
+            dstPort = 443,
+            flags = PacketDissector.TCP_FLAG_SYN,
+            payload = ByteArray(0)
+        )
+        firstFrag[6] = 0x20 // MF set, offset 0
+        firstFrag[7] = 0x00
+        val firstPkt = PacketDissector.dissect(10L, firstFrag, 1_700_000_000_000L, 0L, PacketDirection.OUTBOUND)
+        assertEquals(ProtocolType.TCP, firstPkt.protocol)
+        assertEquals(443, firstPkt.dstPort)
+    }
+
+    @Test
+    fun oversizedFilterIsRejectedInsteadOfStackOverflowing() {
+        // Length guard fires before any recursion (512 chars max).
+        val tooLong = DisplayFilterParser.parse(
+            query = "(!".repeat(500),
+            quickFilter = QuickFilter.ALL
+        )
+        assertFalse(tooLong.isValid)
+        assertTrue(tooLong.errorHint?.contains("512") == true)
+
+        // Within the cap, deep recursion must complete normally — an uncaught
+        // StackOverflowError would crash the app (the parser runs on the main thread).
+        // Deep '!' chain bottoms out in a missing-expression error, not a crash.
+        val deepNot = DisplayFilterParser.parse("!".repeat(200), QuickFilter.ALL)
+        assertFalse(deepNot.isValid)
+
+        // Deep balanced parens must parse successfully end to end.
+        val deepParens = DisplayFilterParser.parse(
+            "(".repeat(100) + "tcp" + ")".repeat(100),
+            QuickFilter.ALL
+        )
+        assertTrue(deepParens.isValid)
+    }
+
     private fun buildIpv4Tcp(
         srcIp: ByteArray,
         dstIp: ByteArray,

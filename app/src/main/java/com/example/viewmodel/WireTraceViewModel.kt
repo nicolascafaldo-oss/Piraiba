@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -95,9 +96,16 @@ class WireTraceViewModel : ViewModel() {
         val appCtx = context.applicationContext
         appContext = appCtx
         viewModelScope.launch {
-            AlertConfigStore.observeConfig(appCtx).collect { loaded ->
-                AlertMonitor.updateConfig(loaded)
-            }
+            AlertConfigStore.observeConfig(appCtx)
+                .catch { e ->
+                    // A corrupted DataStore file throws on read; without this catch the
+                    // exception escapes viewModelScope and kills the process. Keep defaults.
+                    _toastEvent.value =
+                        "Alert settings could not be read (${e.message ?: "corrupt file"}); using defaults"
+                }
+                .collect { loaded ->
+                    AlertMonitor.updateConfig(loaded)
+                }
         }
     }
 
@@ -207,7 +215,7 @@ class WireTraceViewModel : ViewModel() {
         val lanBuffered = allPackets.count { it.captureSource == CaptureSource.LAN_PROMISCUOUS }
         val phoneBuffered = allPackets.size - lanBuffered
         LanSummaryState(enabled, listening, count, scopeFilter, phoneBuffered, lanBuffered)
-    }
+    }.flowOn(Dispatchers.Default) // O(n) packet classification off the main thread (runs per flush)
 
     val uiState: StateFlow<CaptureUiState> = combine(
         CaptureRepository.isCapturing,
@@ -261,7 +269,8 @@ class WireTraceViewModel : ViewModel() {
         _selectedPacketId
     ) { packets, selectedId ->
         selectedId?.let { id -> packets.find { it.id == id } }
-    }.stateIn(
+    }.flowOn(Dispatchers.Default) // O(n) lookup must not run on the main thread at flush rate
+        .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000),
         initialValue = null
@@ -483,9 +492,17 @@ class WireTraceViewModel : ViewModel() {
                     if (imported.isEmpty()) {
                         _toastEvent.value = "No valid IP packets found in file"
                     } else {
-                        _selectedPacketId.value = imported.firstOrNull()?.id
-                        CaptureRepository.replaceWithImportedPackets(imported)
-                        _toastEvent.value = "Loaded ${imported.size} packets from .pcap"
+                        val retained = CaptureRepository.replaceWithImportedPackets(imported)
+                        // Select from what was actually retained (ids are remapped, and packets
+                        // beyond the 4000-packet buffer cap are evicted).
+                        _selectedPacketId.value = retained.firstOrNull()?.id
+                        // Report what the user can actually see: the ring buffer may have
+                        // evicted older packets from a large file.
+                        _toastEvent.value = if (retained.size == imported.size) {
+                            "Loaded ${imported.size} packets from .pcap"
+                        } else {
+                            "Loaded ${imported.size} packets from .pcap — showing the newest ${retained.size} (buffer cap)"
+                        }
                     }
                 },
                 onFailure = {

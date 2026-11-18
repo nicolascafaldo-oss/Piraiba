@@ -14,6 +14,7 @@ import com.example.MainActivity
 import com.example.R
 import com.example.capture.CaptureRepository
 import com.example.capture.DnsResolutionCache
+import com.example.capture.RootPromiscuousSniffer
 import com.example.dissector.PacketDissector
 import com.example.model.PacketDirection
 import java.io.FileInputStream
@@ -87,10 +88,20 @@ class PacketCaptureVpnService : VpnService() {
         @Volatile var state: TcpState,
         @Volatile var clientSeq: Long,
         @Volatile var serverSeq: Long,
-        @Volatile var lastActiveMs: Long = System.currentTimeMillis()
+        @Volatile var lastActiveMs: Long = System.currentTimeMillis(),
+        // Server's initial sequence number (the SYN-ACK seq). Retained separately from
+        // serverSeq because the latter advances with every data byte sent; SYN-ACK
+        // retransmissions must always use the ISN.
+        val serverIsn: Long
     ) {
         val pendingWrites = ArrayDeque<ByteBuffer>()
         var selectionKey: SelectionKey? = null
+        // Selector-thread confined: set when a client half-close arrives with writes still
+        // queued; cleared once they drain and shutdownOutput() is performed.
+        var shutdownOutputWhenDrained = false
+        // True once FIN has been sent to the client (set on the selector thread).
+        @Volatile
+        var finSentToClient = false
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -216,6 +227,17 @@ class PacketCaptureVpnService : VpnService() {
     }
 
     private fun stopCapture(reason: String?) {
+        // Master stop: the root tcpdump sniffer and LAN multicast listener are separate
+        // capture backends that outlive this service. The notification's "Stop capture"
+        // action (and revoke/destroy) must silence them too — otherwise packets keep
+        // being captured with no foreground notification after capture "stopped".
+        runCatching { RootPromiscuousSniffer.stopCapture() }
+        if (CaptureRepository.lanMulticastEnabled.value) {
+            runCatching {
+                CaptureRepository.setLanMulticastEnabled(applicationContext, false)
+            }
+        }
+
         running.set(false)
         selectorTasks.clear()
         runCatching { selector?.wakeup() }
@@ -277,6 +299,12 @@ class PacketCaptureVpnService : VpnService() {
 
         val ihl = (raw[0].toInt() and 0x0F) * 4
         if (ihl < 20 || ihl > raw.size) return
+        // Fragmented datagrams cannot be forwarded safely: non-first fragments carry no
+        // transport header (ports would be read out of payload bytes, corrupting sessions)
+        // and this forwarder does no reassembly. Drop fragments — the packet is still
+        // recorded for display by the caller before dispatch.
+        val flagsAndFrag = ((raw[6].toInt() and 0xFF) shl 8) or (raw[7].toInt() and 0xFF)
+        if ((flagsAndFrag and 0x1FFF) != 0 || (flagsAndFrag and 0x2000) != 0) return
         val totalLen = (((raw[2].toInt() and 0xFF) shl 8) or (raw[3].toInt() and 0xFF)).coerceAtMost(raw.size)
         val proto = raw[9].toInt() and 0xFF
         val srcIpBytes = raw.copyOfRange(12, 16)
@@ -377,6 +405,27 @@ class PacketCaptureVpnService : VpnService() {
         }
 
         if (isSyn && !isAck) {
+            val existing = tcpSessions[key]
+            if (existing != null) {
+                when (existing.state) {
+                    // Handshake still in flight: this is a SYN retransmit (common on lossy
+                    // mobile networks). Keep the current attempt instead of killing the
+                    // channel mid-connect and redialing.
+                    TcpState.CONNECTING -> return
+                    // Our SYN-ACK was likely lost — resend it (original ISN = serverSeq - 1)
+                    // rather than tearing down an established session and churning the server.
+                    TcpState.ESTABLISHED -> {
+                        sendTcpControlPacket(
+                            session = existing,
+                            flags = PacketDissector.TCP_FLAG_SYN or PacketDissector.TCP_FLAG_ACK,
+                            seq = existing.serverIsn,
+                            ack = (seq + 1L) and 0xFFFFFFFFL
+                        )
+                        return
+                    }
+                    else -> { /* stale session (FIN_SENT/CLOSED): replace it below */ }
+                }
+            }
             tcpSessions.remove(key)?.let { old ->
                 old.state = TcpState.CLOSED
                 enqueueSelectorTask { runCatching { old.channel.close() } }
@@ -396,7 +445,8 @@ class PacketCaptureVpnService : VpnService() {
                     channel = channel,
                     state = TcpState.CONNECTING,
                     clientSeq = (seq + 1L) and 0xFFFFFFFFL,
-                    serverSeq = initialServerSeq
+                    serverSeq = initialServerSeq,
+                    serverIsn = initialServerSeq
                 )
                 tcpSessions[key] = session
                 val connectedImmediately = channel.connect(InetSocketAddress(dstAddr, dstPort))
@@ -405,12 +455,20 @@ class PacketCaptureVpnService : VpnService() {
                     if (!channel.isOpen) return@enqueueSelectorTask
                     runCatching {
                         if (connectedImmediately) {
-                            session.state = TcpState.ESTABLISHED
+                            if (session.state == TcpState.CONNECTING) {
+                                // Don't clobber FIN_SENT (client may have half-closed while
+                                // this task waited in the queue).
+                                session.state = TcpState.ESTABLISHED
+                            }
                             sendTcpControlPacket(
                                 session = session,
                                 flags = PacketDissector.TCP_FLAG_SYN or PacketDissector.TCP_FLAG_ACK
                             )
                             session.serverSeq = (session.serverSeq + 1L) and 0xFFFFFFFFL
+                            if (session.shutdownOutputWhenDrained && session.pendingWrites.isEmpty()) {
+                                session.shutdownOutputWhenDrained = false
+                                runCatching { session.channel.shutdownOutput() }
+                            }
                             session.selectionKey = channel.register(sel, SelectionKey.OP_READ, session)
                         } else {
                             session.selectionKey = channel.register(sel, SelectionKey.OP_CONNECT, session)
@@ -444,17 +502,37 @@ class PacketCaptureVpnService : VpnService() {
 
         if (isFin) {
             session.clientSeq = (session.clientSeq + 1L) and 0xFFFFFFFFL
-            if (session.state != TcpState.FIN_SENT && session.state != TcpState.CLOSED) {
+            if (session.state == TcpState.ESTABLISHED || session.state == TcpState.CONNECTING) {
                 session.state = TcpState.FIN_SENT
-                sendTcpControlPacket(session, PacketDissector.TCP_FLAG_FIN or PacketDissector.TCP_FLAG_ACK)
-                session.serverSeq = (session.serverSeq + 1L) and 0xFFFFFFFFL
-            } else {
+                // ACK the client's FIN immediately, but KEEP the upstream connection open:
+                // forward the half-close (after draining queued writes) so the server can
+                // still deliver its remaining data. The old code removed the session and
+                // closed the channel right here, discarding every in-flight response.
                 sendTcpControlPacket(session, PacketDissector.TCP_FLAG_ACK)
-            }
-            enqueueSelectorTask {
-                tcpSessions.remove(key)
-                session.state = TcpState.CLOSED
-                runCatching { session.channel.close() }
+                enqueueSelectorTask {
+                    // Selector-thread confined; serialized with finishConnect()/isWritable
+                    // on the same thread, so isConnected is stable here.
+                    if (session.pendingWrites.isEmpty()) {
+                        if (session.channel.isConnected) {
+                            runCatching { session.channel.shutdownOutput() }
+                        } else {
+                            // Handshake still in flight: shutdownOutput() would throw
+                            // NotYetConnectedException here. finishConnect() performs it.
+                            session.shutdownOutputWhenDrained = true
+                        }
+                    } else {
+                        // Drain remaining writes first; shutdownOutput runs from the
+                        // selector's isWritable handler once pendingWrites is empty.
+                        session.shutdownOutputWhenDrained = true
+                        val sk = session.selectionKey
+                        if (sk != null && sk.isValid) {
+                            sk.interestOps(sk.interestOps() or SelectionKey.OP_WRITE)
+                        }
+                    }
+                }
+            } else {
+                // Retransmitted FIN (or session already closing): re-ACK only.
+                sendTcpControlPacket(session, PacketDissector.TCP_FLAG_ACK)
             }
         }
     }
@@ -531,13 +609,23 @@ class PacketCaptureVpnService : VpnService() {
         if (key.isConnectable) {
             val finished = runCatching { session.channel.finishConnect() }.getOrElse { false }
             if (finished) {
-                session.state = TcpState.ESTABLISHED
+                if (session.state == TcpState.CONNECTING) {
+                    // Don't clobber FIN_SENT: the client may have half-closed while the
+                    // handshake was in flight (the flag check below then performs it).
+                    session.state = TcpState.ESTABLISHED
+                }
                 session.lastActiveMs = System.currentTimeMillis()
                 sendTcpControlPacket(
                     session = session,
                     flags = PacketDissector.TCP_FLAG_SYN or PacketDissector.TCP_FLAG_ACK
                 )
                 session.serverSeq = (session.serverSeq + 1L) and 0xFFFFFFFFL
+                if (session.shutdownOutputWhenDrained && session.pendingWrites.isEmpty()) {
+                    // Client FINed while the handshake was still in flight; the earlier
+                    // shutdownOutput() attempt failed on the unconnected socket. Do it now.
+                    session.shutdownOutputWhenDrained = false
+                    runCatching { session.channel.shutdownOutput() }
+                }
                 val ops = SelectionKey.OP_READ or
                     if (session.pendingWrites.isNotEmpty()) SelectionKey.OP_WRITE else 0
                 key.interestOps(ops)
@@ -560,6 +648,12 @@ class PacketCaptureVpnService : VpnService() {
             }
             if (session.pendingWrites.isEmpty() && key.isValid) {
                 key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+                if (session.shutdownOutputWhenDrained) {
+                    // Client half-closed while writes were still queued; now that everything
+                    // is forwarded, propagate the FIN upstream.
+                    session.shutdownOutputWhenDrained = false
+                    runCatching { session.channel.shutdownOutput() }
+                }
             }
         }
 
@@ -584,7 +678,13 @@ class PacketCaptureVpnService : VpnService() {
                 session.serverSeq = (session.serverSeq + read.toLong()) and 0xFFFFFFFFL
                 emitInboundToTun(ipPacket)
             } else if (read < 0) {
-                if (session.state == TcpState.ESTABLISHED) {
+                // Server side finished. Notify the client with FIN unless we already did —
+                // including the half-closed case (client sent FIN first), which the old
+                // `state == ESTABLISHED` check silently skipped, leaving the client hanging.
+                if (!session.finSentToClient &&
+                    (session.state == TcpState.ESTABLISHED || session.state == TcpState.FIN_SENT)
+                ) {
+                    session.finSentToClient = true
                     session.state = TcpState.FIN_SENT
                     sendTcpControlPacket(
                         session = session,
@@ -627,14 +727,19 @@ class PacketCaptureVpnService : VpnService() {
         }
     }
 
-    private fun sendTcpControlPacket(session: TcpSession, flags: Int) {
+    private fun sendTcpControlPacket(
+        session: TcpSession,
+        flags: Int,
+        seq: Long = session.serverSeq,
+        ack: Long = session.clientSeq
+    ) {
         val pkt = buildIpv4TcpPacket(
             srcIp = session.dstIpBytes,
             dstIp = session.srcIpBytes,
             srcPort = session.key.dstPort,
             dstPort = session.key.srcPort,
-            seq = session.serverSeq,
-            ack = session.clientSeq,
+            seq = seq,
+            ack = ack,
             flags = flags,
             payload = ByteArray(0)
         )

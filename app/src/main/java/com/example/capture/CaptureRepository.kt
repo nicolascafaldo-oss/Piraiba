@@ -48,7 +48,14 @@ object CaptureRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val bufferLock = Any()
     private val packetBuffer = ArrayDeque<CapturedPacket>(MAX_BUFFERED_PACKETS)
+    // Identity counter: strictly monotonic, NEVER reset — ids are allocated from it by every
+    // capture backend and by pcap import (remapped), so buffer keys can never collide even if
+    // a packet is in flight across a clear/import.
     private val nextPacketId = AtomicLong(0L)
+    // Session-scoped display counters (reset by clearCapture / import); kept separate from
+    // nextPacketId so clearing does not break packet identity.
+    private val sessionPacketCount = AtomicLong(0L)
+    private val sessionByteCount = AtomicLong(0L)
     private val dirty = AtomicBoolean(false)
 
     private val throughputLock = Any()
@@ -117,6 +124,17 @@ object CaptureRepository {
             LanMulticastSniffer.start(context, vpnSocketProtector)
             scope.launch(Dispatchers.IO) {
                 runCatching { LanMulticastSniffer.sendDiscoverySweep(vpnSocketProtector) }
+                    .onSuccess { result ->
+                        // Don't silently drop sweep failures (e.g. VPN protect() refusal):
+                        // the toggle toast says "active" and would otherwise be the only
+                        // thing the user sees.
+                        if (!result.startsWith("Sent")) {
+                            postStatus(result, isError = result.contains("skipped"))
+                        }
+                    }
+                    .onFailure {
+                        postStatus("LAN discovery sweep failed: ${it.message ?: "unknown error"}", isError = true)
+                    }
             }
         } else {
             LanMulticastSniffer.stop(resetCount = false)
@@ -148,6 +166,18 @@ object CaptureRepository {
                 isError = isError
             )
         }
+    }
+
+    /**
+     * Posts a status event WITHOUT touching the capturing flag — used when a stop *request* itself failed and the real capture state is unknown. Claiming
+     * "stopped" there would hide a still-running capture.
+     */
+    fun postStatus(message: String, isError: Boolean = false) {
+        _statusMessage.value = CaptureStatusEvent(
+            id = statusSeq.incrementAndGet(),
+            message = message,
+            isError = isError
+        )
     }
 
     fun clearStatusMessage() {
@@ -185,8 +215,11 @@ object CaptureRepository {
         DnsResolutionCache.ingestPacket(dissected)
         AlertMonitor.evaluatePacket(dissected)
 
-        _totalPacketCount.value = id
-        _totalBytes.value += rawBytes.size.toLong()
+        sessionPacketCount.incrementAndGet()
+        sessionByteCount.addAndGet(rawBytes.size.toLong())
+        // NOTE: _totalPacketCount/_totalBytes are NOT set here. Per-packet StateFlow writes
+        // made the 15-flow uiState combine re-emit (and recompose the top-level UI) for
+        // EVERY packet at line rate; they are published by the 120 ms flush loop instead.
 
         val sec = now / 1000L
         synchronized(throughputLock) {
@@ -207,39 +240,60 @@ object CaptureRepository {
         dirty.set(true)
     }
 
-    fun replaceWithImportedPackets(imported: List<CapturedPacket>) {
-        synchronized(bufferLock) {
+    /**
+     * Replaces the buffer with an imported capture. Imported packets are REMAPPED to fresh ids
+     * from [nextPacketId] while holding [bufferLock], so they can never collide with a live
+     * packet that was allocated an id before this call and inserts itself afterwards.
+     * Returns the packets actually retained (at most [MAX_BUFFERED_PACKETS]).
+     */
+    fun replaceWithImportedPackets(imported: List<CapturedPacket>): List<CapturedPacket> {
+        val retained = synchronized(bufferLock) {
             packetBuffer.clear()
-            for (pkt in imported.takeLast(MAX_BUFFERED_PACKETS)) {
-                packetBuffer.addLast(pkt)
+            val remapped = imported.takeLast(MAX_BUFFERED_PACKETS).map { pkt ->
+                pkt.copy(id = nextPacketId.incrementAndGet())
             }
+            remapped.forEach { packetBuffer.addLast(it) }
+            // The header stats ("All captured packets (N pkts • B)", "• N total") must
+            // describe what is actually held: after an import the buffer contains ONLY the
+            // imported packets (cap-truncated), and the byte counter previously summed the
+            // full `imported` list — overstating bytes whenever the cap evicted packets.
+            // Import redefines the capture set, exactly like clearCapture does.
+            val bytes = remapped.sumOf { it.rawBytes.size.toLong() }
+            sessionPacketCount.set(remapped.size.toLong())
+            _totalPacketCount.value = remapped.size.toLong()
+            sessionByteCount.set(bytes)
+            _totalBytes.value = bytes
+            remapped
         }
-        nextPacketId.set(imported.lastOrNull()?.id ?: 0L)
-        _totalPacketCount.value = imported.size.toLong()
-        _totalBytes.value = imported.sumOf { it.length.toLong() }
         _captureStartTimeMs.value = imported.firstOrNull()?.timestampMs
         synchronized(throughputLock) {
             secondBuckets.clear()
         }
-        val limited = imported.takeLast(MAX_BUFFERED_PACKETS)
-        _packets.value = limited
+        _packets.value = retained
         _throughputHistory.value = emptyList()
         DnsResolutionCache.clear()
-        DnsResolutionCache.ingestPackets(limited)
+        DnsResolutionCache.ingestPackets(retained)
         AlertMonitor.resetTrackingState()
-        limited.forEach { AlertMonitor.evaluatePacket(it) }
+        retained.forEach { AlertMonitor.evaluatePacket(it) }
+        return retained
     }
 
     fun clearCapture() {
         synchronized(bufferLock) {
             packetBuffer.clear()
+            // NOTE: nextPacketId is deliberately NOT reset — see field comment. Resetting it is what
+            // previously allowed duplicate packet ids (and a LazyColumn key crash) when a writer
+            // was in flight across a clear.
+            // Counter resets live inside the same lock as flushToStateFlows' publication so a
+            // concurrent flush can't resurrect pre-clear totals after this returns.
+            sessionPacketCount.set(0L)
+            _totalPacketCount.value = 0L
+            sessionByteCount.set(0L)
+            _totalBytes.value = 0L
         }
         synchronized(throughputLock) {
             secondBuckets.clear()
         }
-        nextPacketId.set(0L)
-        _totalPacketCount.value = 0L
-        _totalBytes.value = 0L
         _captureStartTimeMs.value = if (_isCapturing.value) System.currentTimeMillis() else null
         _packets.value = emptyList()
         _throughputHistory.value = emptyList()
@@ -254,8 +308,14 @@ object CaptureRepository {
     }
 
     private fun flushToStateFlows() {
-        val snapshot = synchronized(bufferLock) { packetBuffer.toList() }
-        _packets.value = snapshot
+        // Snapshot AND counter publication happen inside bufferLock so clearCapture/
+        // replaceWithImportedPackets (which reset counters under the same lock) can never
+        // interleave with a preempted flush that would re-publish stale pre-clear totals.
+        synchronized(bufferLock) {
+            _packets.value = packetBuffer.toList()
+            _totalPacketCount.value = sessionPacketCount.get()
+            _totalBytes.value = sessionByteCount.get()
+        }
         updateThroughputOnly()
     }
 

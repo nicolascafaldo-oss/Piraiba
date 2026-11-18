@@ -26,6 +26,15 @@ data class ParsedDisplayFilter(
  */
 object DisplayFilterParser {
 
+    /**
+     * Guards against pathological input: the parser recurses per leading '!' and per nested
+     * '(' (and re-scans per level in splitTopLevel), and it runs on the main thread from a
+     * flow combine. Without a cap, a pasted multi-KB string of "!!!!" or "(((((..." produces
+     * a StackOverflowError — an Error, which the IllegalArgumentException catch below cannot
+     * handle — and crashes the app. 512 chars bounds recursion to a few hundred frames.
+     */
+    private const val MAX_FILTER_LENGTH = 512
+
     fun parse(
         query: String,
         quickFilter: QuickFilter,
@@ -44,6 +53,14 @@ object DisplayFilterParser {
 
         if (trimmed.isEmpty()) {
             return ParsedDisplayFilter(isValid = true, matches = quickPred)
+        }
+
+        if (trimmed.length > MAX_FILTER_LENGTH) {
+            return ParsedDisplayFilter(
+                isValid = false,
+                errorHint = "Filter too long (maximum $MAX_FILTER_LENGTH characters)",
+                matches = { _ -> false }
+            )
         }
 
         return try {

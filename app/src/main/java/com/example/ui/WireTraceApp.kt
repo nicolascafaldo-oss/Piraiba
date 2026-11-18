@@ -89,6 +89,7 @@ import com.example.capture.AlertConfigStore
 import com.example.capture.CaptureRepository
 import com.example.model.ProbeType
 import com.example.model.QuickFilter
+import com.example.model.RootSandboxStatus
 import com.example.ui.components.ExportPcapDialog
 import com.example.ui.components.LiveCaptureIndicator
 import com.example.ui.screens.AlertConfigScreen
@@ -130,6 +131,13 @@ fun WireTraceApp(
     val latestAlertEvent by viewModel.latestAlertEvent.collectAsStateWithLifecycle()
     val rootSandboxState by viewModel.rootSandboxState.collectAsStateWithLifecycle()
 
+    // The top bar must reflect EVERY capture backend, not just the VPN tunnel: with root
+    // tcpdump or LAN multicast listen running (VPN off), the old VPN-only flag showed
+    // "IDLE / Start capture" while packets were actively being captured — and Stop must
+    // be offered whenever anything is capturing (stopVpnService is the master stop).
+    val rootCaptureRunning = rootSandboxState.status == RootSandboxStatus.ROOT_RUNNING
+    val anyCaptureActive = uiState.isCapturing || uiState.lanMulticastActive || rootCaptureRunning
+
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
@@ -155,11 +163,18 @@ fun WireTraceApp(
 
     LaunchedEffect(vpnStatus?.id) {
         val status = vpnStatus ?: return@LaunchedEffect
-        CaptureRepository.clearStatusMessage()
         if (status.isError) {
+            // Clear BEFORE showing: the dialog is plain state, not tied to this effect's
+            // lifetime, so clearing here can't cancel anything.
+            CaptureRepository.clearStatusMessage()
             vpnIssueDialogMessage = status.message
         } else {
+            // Show FIRST, clear AFTER. Clearing before showSnackbar changed this effect's
+            // key (vpnStatus?.id → null), which restarted the effect and cancelled the
+            // very showSnackbar call — status messages flashed for a frame or never
+            // appeared at all.
             snackbarHostState.showSnackbar(status.message)
+            CaptureRepository.clearStatusMessage()
         }
     }
 
@@ -210,13 +225,27 @@ fun WireTraceApp(
     }
 
     fun stopVpnService() {
+        // Master stop: tear down EVERY capture backend, not just the VPN tunnel.
+        // Root tcpdump previously had no stop path outside its sandbox dialog and kept
+        // capturing (with no notification) after the top-bar Stop; LAN listen had its
+        // own switch but the button reads "Stop capture" — make it true for both.
+        viewModel.stopRootSandboxCapture()
+        if (CaptureRepository.lanMulticastEnabled.value) {
+            CaptureRepository.setLanMulticastEnabled(context.applicationContext, false)
+        }
         try {
             val intent = Intent(context, PacketCaptureVpnService::class.java).apply {
                 action = PacketCaptureVpnService.ACTION_STOP
             }
             context.startService(intent)
-        } catch (_: Exception) {
-            CaptureRepository.onCaptureStopped("Capture stopped")
+        } catch (e: Exception) {
+            // Do NOT claim "Capture stopped": the service may still be up and capturing.
+            // Surface the failure and leave isCapturing untouched so the button keeps
+            // offering Stop and the user can retry.
+            CaptureRepository.postStatus(
+                "Could not reach the capture service to stop it (${e.message ?: "unknown error"}). Capture may still be running.",
+                isError = true
+            )
         }
     }
 
@@ -422,31 +451,31 @@ fun WireTraceApp(
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                                LiveCaptureIndicator(isCapturing = uiState.isCapturing)
+                                LiveCaptureIndicator(isCapturing = anyCaptureActive)
                             }
                         },
                         actions = {
                             Button(
                                 onClick = {
-                                    if (uiState.isCapturing) stopVpnService() else requestStartCapture()
+                                    if (anyCaptureActive) stopVpnService() else requestStartCapture()
                                 },
                                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (uiState.isCapturing) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                                    contentColor = if (uiState.isCapturing) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
+                                    containerColor = if (anyCaptureActive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                    contentColor = if (anyCaptureActive) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary
                                 ),
                                 modifier = Modifier
                                     .padding(end = 2.dp)
                                     .testTag("start_stop_capture_button")
                             ) {
                                 Icon(
-                                    imageVector = if (uiState.isCapturing) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
-                                    contentDescription = if (uiState.isCapturing) "Stop capture" else "Start capture",
+                                    imageVector = if (anyCaptureActive) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
+                                    contentDescription = if (anyCaptureActive) "Stop capture" else "Start capture",
                                     modifier = Modifier.size(18.dp)
                                 )
                                 Spacer(Modifier.width(4.dp))
                                 Text(
-                                    text = if (uiState.isCapturing) {
+                                    text = if (anyCaptureActive) {
                                         stringResource(R.string.action_stop_capture)
                                     } else {
                                         stringResource(R.string.action_start_capture)

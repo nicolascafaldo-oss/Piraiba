@@ -33,6 +33,8 @@ object DnsResolutionCache {
     private const val PTR_TIMEOUT_MS = 1500
     private const val WORKER_COUNT = 3
     private const val MAX_CACHED_HOSTS = 2000
+    private const val MAX_COOLDOWN_ENTRIES = 512
+    private const val MDNS_SOURCE_PORT = 5353
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val txIdCounter = AtomicInteger(0x2100)
@@ -208,12 +210,31 @@ object DnsResolutionCache {
 
     private fun maybeEnqueuePtr(ip: String) {
         if (!isResolvableAnyIp(ip)) return
-        if (cache.containsKey(ip)) return
+        if (cache.containsKey(ip)) {
+            // Already resolved — a leftover cooldown entry for this IP serves no purpose.
+            lookupCooldownUntil.remove(ip)
+            return
+        }
         val now = System.currentTimeMillis()
         val cooldown = lookupCooldownUntil[ip]
         if (cooldown != null && now < cooldown) return
         lookupCooldownUntil[ip] = now + NEGATIVE_RETRY_MS
+        pruneCooldowns(now)
         ptrQueue.trySend(ip)
+    }
+
+    /**
+     * lookupCooldownUntil previously grew without bound (one entry per distinct IP ever
+     * seen, removed only by clear()). Cap it: drop expired entries first, then trim any
+     * excess — a dropped entry only costs one extra retry after its cooldown expired anyway.
+     */
+    private fun pruneCooldowns(now: Long) {
+        if (lookupCooldownUntil.size <= MAX_COOLDOWN_ENTRIES) return
+        lookupCooldownUntil.entries.removeIf { it.value <= now }
+        val excess = lookupCooldownUntil.size - MAX_COOLDOWN_ENTRIES
+        if (excess > 0) {
+            lookupCooldownUntil.keys.take(excess).forEach { lookupCooldownUntil.remove(it) }
+        }
     }
 
     private fun performPtrLookup(ip: String) {
@@ -255,18 +276,32 @@ object DnsResolutionCache {
         dnsPort: Int,
         protector: ((DatagramSocket) -> Boolean)?
     ): String? {
-        val txId = if (dnsPort == 5353) 0 else (txIdCounter.incrementAndGet() and 0xFFFF)
+        val isMulticast = dnsPort == 5353
+        val txId = if (isMulticast) 0 else (txIdCounter.incrementAndGet() and 0xFFFF)
         val queryBytes = buildPtrQueryPacket(ip, txId) ?: return null
         return runCatching {
             DatagramSocket().use { socket ->
                 if (protector != null && !protector(socket)) return@runCatching null
                 socket.soTimeout = PTR_TIMEOUT_MS
                 val dnsServer = InetAddress.getByName(dnsServerIp)
+                if (!isMulticast) {
+                    // Connected sockets only deliver datagrams from the connected peer, so a
+                    // spoofed reply from any other host/port never reaches parse(). An
+                    // unconnected socket accepted replies from ANY sender, letting an off-path
+                    // forger poison the resolution cache shown in the UI.
+                    socket.connect(dnsServer, dnsPort)
+                }
                 socket.send(DatagramPacket(queryBytes, queryBytes.size, dnsServer, dnsPort))
                 val buf = ByteArray(1024)
                 val resp = DatagramPacket(buf, buf.size)
                 socket.receive(resp)
-                parsePtrResponse(buf.copyOf(resp.length), expectedTxId = if (dnsPort == 5353) null else txId)
+                if (isMulticast) {
+                    // mDNS cannot be connected (responses legitimately arrive from the
+                    // responder's unicast address), but they must come from source port 5353
+                    // — rejects stray/forged datagrams from other ports.
+                    if (resp.port != MDNS_SOURCE_PORT) return@runCatching null
+                }
+                parsePtrResponse(buf.copyOf(resp.length), expectedTxId = txId)
             }
         }.getOrNull()
     }

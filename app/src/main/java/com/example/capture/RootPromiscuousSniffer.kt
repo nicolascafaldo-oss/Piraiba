@@ -39,11 +39,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 object RootPromiscuousSniffer {
 
     private const val MAX_LOG_LINES = 80
+    private const val FRAME_PUBLISH_INTERVAL_MS = 500L
     private val ifaceRegex = Regex("^[a-zA-Z0-9._:-]{1,32}$")
     private val bpfSafeRegex = Regex("^[a-zA-Z0-9 .:_/()=!<>&|-]{0,160}$")
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val capturing = AtomicBoolean(false)
+
+    // Frame counter lives here (not in the StateFlow): publishing _state per captured frame
+    // recomposed the whole top-level UI at packet rate under a busy root capture.
+    private val frameCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val lastFramePublishMs = java.util.concurrent.atomic.AtomicLong(0L)
 
     private val _state = MutableStateFlow(RootSandboxState())
     val state: StateFlow<RootSandboxState> = _state.asStateFlow()
@@ -218,6 +224,8 @@ object RootPromiscuousSniffer {
                 statusDetail = "Streaming raw libpcap frames on $iface (${if (snapshot.promiscuousMode) "IFF_PROMISC" else "non-promiscuous"})..."
             )
         }
+        frameCount.set(0L)
+        lastFramePublishMs.set(0L)
         appendLog("Starting: su -c \"$shellCmd\"")
 
         captureJob = scope.launch {
@@ -240,8 +248,8 @@ object RootPromiscuousSniffer {
 
                 parseLibpcapStream(proc.inputStream) { frameBytes, linkLayerType ->
                     val dir = inferDirectionFromFrame(frameBytes, linkLayerType, localIps)
-                    val count = _state.value.capturedFrames + 1L
-                    _state.update { it.copy(capturedFrames = count) }
+                    val count = frameCount.incrementAndGet()
+                    maybePublishFrameCount(count)
                     CaptureRepository.recordRawPacket(
                         rawBytes = frameBytes,
                         direction = dir,
@@ -256,7 +264,8 @@ object RootPromiscuousSniffer {
                     _state.update {
                         it.copy(
                             status = RootSandboxStatus.ROOT_READY,
-                            statusDetail = "Root capture stopped (exit=$code, ${it.capturedFrames} frames captured)."
+                            capturedFrames = frameCount.get(),
+                            statusDetail = "Root capture stopped (exit=$code, ${frameCount.get()} frames captured)."
                         )
                     }
                 }
@@ -267,6 +276,7 @@ object RootPromiscuousSniffer {
                     _state.update {
                         it.copy(
                             status = RootSandboxStatus.ERROR,
+                            capturedFrames = frameCount.get(),
                             statusDetail = "Root stream ended: ${e.message ?: "stream error"}"
                         )
                     }
@@ -301,9 +311,23 @@ object RootPromiscuousSniffer {
             _state.update {
                 it.copy(
                     status = readyStatus,
-                    statusDetail = "Stopped (${it.capturedFrames} root frames captured)."
+                    capturedFrames = frameCount.get(),
+                    statusDetail = "Stopped (${frameCount.get()} root frames captured)."
                 )
             }
+        }
+    }
+
+    /**
+     * Publishes the frame counter to the UI state at most every
+     * [FRAME_PUBLISH_INTERVAL_MS] so a busy capture cannot recompose the top-level UI
+     * once per frame; exit paths publish the exact final count.
+     */
+    private fun maybePublishFrameCount(count: Long) {
+        val nowMs = System.currentTimeMillis()
+        val last = lastFramePublishMs.get()
+        if (nowMs - last >= FRAME_PUBLISH_INTERVAL_MS && lastFramePublishMs.compareAndSet(last, nowMs)) {
+            _state.update { it.copy(capturedFrames = count) }
         }
     }
 
