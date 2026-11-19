@@ -1,6 +1,7 @@
 <resources>
     <string name="app_name">Piraíba</string>
     <string name="nav_packets">Packets</string>
+    <string name="nav_sandbox">Sandbox</string>
     <string name="nav_streams">Streams</string>
     <string name="nav_analytics">Analytics</string>
     <string name="nav_alerts">Alerts</string>

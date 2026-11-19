@@ -122,7 +122,7 @@ fun StreamsScreen(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -209,7 +209,7 @@ fun StreamsScreen(
                     )
                     Text(
                         text = if (scopeFilter == TrafficScopeFilter.LAN_ONLY) {
-                            "Enable Promiscuous LAN Listen or fire a LAN Multicast Sweep to group mDNS & SSDP peer announcements here."
+                            "Enable passive Multicast Listen or start Root Capture in the Sandbox tab to group LAN mDNS & SSDP streams here."
                         } else {
                             "Start VPN Capture on tun0 to group Phone TCP and UDP conversations separately from LAN broadcasts."
                         },
@@ -224,8 +224,8 @@ fun StreamsScreen(
             }
         } else {
             LazyColumn(
-                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()

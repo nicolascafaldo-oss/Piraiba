@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.ByteArrayOutputStream
+import java.net.BindException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -353,10 +354,11 @@ object LanMulticastSniffer {
                 }
             }
         } catch (e: Exception) {
-            // Privileged port (<1024) on stock non-root Android or closed cleanly.
-            // Report genuine self-death so a silently dead listener isn't mistaken
-            // for an active capture.
-            if (running.get() && this.generation.get() == generation) {
+            // Privileged port (<1024, e.g. NBNS 137) is rejected with EACCES on stock
+            // non-root Android; only surface failures on unprivileged ports or non-bind errors
+            // so a normal non-root multicast session doesn't trigger a spurious error dialog.
+            val isExpectedPrivPortDenied = port < 1024 && (e is BindException || e is SecurityException)
+            if (!isExpectedPrivPortDenied && running.get() && this.generation.get() == generation) {
                 reportListenerDeath(port, e.message ?: e.javaClass.simpleName)
             }
         } finally {

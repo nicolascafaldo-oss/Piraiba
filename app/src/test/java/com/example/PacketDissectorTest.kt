@@ -11,15 +11,29 @@ import com.example.model.QuickFilter
 import com.example.model.ResolutionSource
 import com.example.model.ResolvedHost
 import com.example.vpn.PacketChecksumUtils
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 
 class PacketDissectorTest {
+
+    @Before
+    fun setUp() {
+        DnsResolutionCache.setAutoPtrEnabled(false)
+        DnsResolutionCache.clear()
+    }
+
+    @After
+    fun tearDown() {
+        DnsResolutionCache.clear()
+        DnsResolutionCache.setAutoPtrEnabled(true)
+    }
 
     @Test
     fun dissectsIpv4TcpHttpPacketAndMatchesPayloadFilter() {
@@ -145,7 +159,6 @@ class PacketDissectorTest {
     @Test
     fun dissectsDnsResponseAndPopulatesResolutionCacheWithPriority() {
         DnsResolutionCache.clear()
-        DnsResolutionCache.setAutoPtrEnabled(false)
 
         val dnsPayload = buildDnsAResponse(
             txId = 0x1A2B,
@@ -176,26 +189,16 @@ class PacketDissectorTest {
         assertEquals(ResolutionSource.DNS_ANSWER, map["93.184.215.14"]?.source)
         assertFalse(map.containsKey("10.1.10.1"))
         DnsResolutionCache.clear()
-        DnsResolutionCache.setAutoPtrEnabled(true)
     }
 
     @Test
-    fun ptrQueryAndResponseCodecWorksForPublicIps() {
-        assertEquals("8.8.8.8.in-addr.arpa", DnsResolutionCache.toArpaDomain("8.8.8.8"))
+    fun passiveIpClassificationIgnoresLocalTunAndAcceptsLanAndPublicIps() {
         assertFalse(DnsResolutionCache.isResolvablePublicIp("10.1.10.1"))
         assertFalse(DnsResolutionCache.isResolvablePublicIp("192.168.1.1"))
         assertTrue(DnsResolutionCache.isResolvablePublicIp("8.8.8.8"))
-
-        val query = DnsResolutionCache.buildPtrQueryPacket("8.8.8.8", txId = 0x4242)!!
-        assertEquals(0x42, query[0].toInt() and 0xFF)
-        assertEquals(0x42, query[1].toInt() and 0xFF)
-
-        val response = buildDnsPtrResponse(
-            txId = 0x4242,
-            qname = "8.8.8.8.in-addr.arpa",
-            ptrHost = "dns.google"
-        )
-        assertEquals("dns.google", DnsResolutionCache.parsePtrResponse(response, expectedTxId = 0x4242))
+        assertFalse(DnsResolutionCache.isResolvableAnyIp("10.1.10.1"))
+        assertTrue(DnsResolutionCache.isResolvableAnyIp("192.168.1.1"))
+        assertTrue(DnsResolutionCache.isResolvableAnyIp("8.8.8.8"))
     }
 
     @Test
@@ -367,30 +370,6 @@ class PacketDissectorTest {
         out.write(0x00); out.write(0x00); out.write(0x01); out.write(0x2C) // TTL 300s
         out.write(0x00); out.write(0x04) // RDLEN 4
         out.write(resolvedIp)
-        return out.toByteArray()
-    }
-
-    private fun buildDnsPtrResponse(txId: Int, qname: String, ptrHost: String): ByteArray {
-        val rdataOut = ByteArrayOutputStream()
-        writeDnsName(rdataOut, ptrHost)
-        val rdata = rdataOut.toByteArray()
-
-        val out = ByteArrayOutputStream()
-        out.write((txId ushr 8) and 0xFF); out.write(txId and 0xFF)
-        out.write(0x81); out.write(0x80)
-        out.write(0x00); out.write(0x01)
-        out.write(0x00); out.write(0x01)
-        out.write(0x00); out.write(0x00)
-        out.write(0x00); out.write(0x00)
-        writeDnsName(out, qname)
-        out.write(0x00); out.write(0x0C) // PTR
-        out.write(0x00); out.write(0x01) // IN
-        out.write(0xC0); out.write(0x0C) // name pointer
-        out.write(0x00); out.write(0x0C) // PTR
-        out.write(0x00); out.write(0x01) // IN
-        out.write(0x00); out.write(0x00); out.write(0x00); out.write(0x3C) // TTL 60s
-        out.write((rdata.size ushr 8) and 0xFF); out.write(rdata.size and 0xFF)
-        out.write(rdata)
         return out.toByteArray()
     }
 

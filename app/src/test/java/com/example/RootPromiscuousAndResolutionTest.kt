@@ -26,8 +26,8 @@ class RootPromiscuousAndResolutionTest {
 
     @Before
     fun setup() {
-        DnsResolutionCache.clear()
         DnsResolutionCache.setAutoPtrEnabled(false)
+        DnsResolutionCache.clear()
     }
 
     @After

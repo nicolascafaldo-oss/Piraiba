@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -126,7 +127,7 @@ fun PacketInspectorPane(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 12.dp)
+            .padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 8.dp)
     ) {
         // Inspector Header
         val isLanPacket = packet.captureSource == CaptureSource.LAN_PROMISCUOUS
@@ -285,7 +286,7 @@ fun PacketInspectorPane(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         SecondaryTabRow(
             selectedTabIndex = selectedTab,
@@ -306,11 +307,12 @@ fun PacketInspectorPane(
             )
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         if (selectedTab == 0) {
             LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()

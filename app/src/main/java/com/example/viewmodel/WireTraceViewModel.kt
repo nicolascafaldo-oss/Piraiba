@@ -68,11 +68,30 @@ data class CaptureUiState(
     val lanBufferedPacketCount: Int = 0
 )
 
+data class SandboxUiState(
+    val rootSandboxState: RootSandboxState = RootSandboxState(),
+    val lanMulticastEnabled: Boolean = false,
+    val lanMulticastActive: Boolean = false,
+    val lanPacketCount: Long = 0L,
+    val totalBufferedLanPackets: Int = 0,
+    val packets: List<CapturedPacket> = emptyList(),
+    val filterQuery: String = "",
+    val quickFilter: QuickFilter = QuickFilter.ALL,
+    val filterValidation: ParsedDisplayFilter = ParsedDisplayFilter(isValid = true) { true },
+    val selectedPacketId: Long? = null,
+    val autoScroll: Boolean = true,
+    val resolveHostnames: Boolean = true,
+    val resolvedDomains: Map<String, ResolvedHost> = emptyMap()
+)
+
 class WireTraceViewModel : ViewModel() {
 
     private val _filterQuery = MutableStateFlow("")
     private val _quickFilter = MutableStateFlow(QuickFilter.ALL)
-    private val _trafficScopeFilter = MutableStateFlow(TrafficScopeFilter.ALL)
+    private val _trafficScopeFilter = MutableStateFlow(TrafficScopeFilter.PHONE_ONLY)
+    private val _sandboxFilterQuery = MutableStateFlow("")
+    private val _sandboxQuickFilter = MutableStateFlow(QuickFilter.ALL)
+    private val _sandboxAutoScroll = MutableStateFlow(true)
     private val _selectedPacketId = MutableStateFlow<Long?>(null)
     private val _autoScroll = MutableStateFlow(true)
     private val _darkTheme = MutableStateFlow(true)
@@ -264,6 +283,73 @@ class WireTraceViewModel : ViewModel() {
         initialValue = CaptureUiState()
     )
 
+    private val parsedSandboxFilterFlow: StateFlow<ParsedDisplayFilter> = combine(
+        _sandboxFilterQuery,
+        _sandboxQuickFilter,
+        DnsResolutionCache.resolvedHosts,
+        _resolveHostnames
+    ) { query, quick, resolvedMap, resolveEnabled ->
+        DisplayFilterParser.parse(
+            query = query,
+            quickFilter = quick,
+            resolvedDomains = if (resolveEnabled) resolvedMap else emptyMap()
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = ParsedDisplayFilter(isValid = true) { true }
+    )
+
+    private val sandboxPacketsAndCount: StateFlow<Pair<List<CapturedPacket>, Int>> = combine(
+        CaptureRepository.packets,
+        parsedSandboxFilterFlow
+    ) { allPackets, parsed ->
+        val lanOnly = allPackets.filter { it.captureSource == CaptureSource.LAN_PROMISCUOUS }
+        lanOnly.filter { parsed.matches(it) } to lanOnly.size
+    }.flowOn(Dispatchers.Default)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList<CapturedPacket>() to 0
+        )
+
+    val sandboxUiState: StateFlow<SandboxUiState> = combine(
+        rootSandboxState,
+        lanSummaryFlow,
+        sandboxPacketsAndCount,
+        _sandboxFilterQuery,
+        _sandboxQuickFilter,
+        parsedSandboxFilterFlow,
+        _selectedPacketId,
+        _sandboxAutoScroll,
+        _resolveHostnames,
+        DnsResolutionCache.resolvedHosts
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        val lanState = values[1] as LanSummaryState
+        @Suppress("UNCHECKED_CAST")
+        val packetsPair = values[2] as Pair<List<CapturedPacket>, Int>
+        SandboxUiState(
+            rootSandboxState = values[0] as RootSandboxState,
+            lanMulticastEnabled = lanState.enabled,
+            lanMulticastActive = lanState.active,
+            lanPacketCount = lanState.lanTotalCount,
+            totalBufferedLanPackets = packetsPair.second,
+            packets = packetsPair.first,
+            filterQuery = values[3] as String,
+            quickFilter = values[4] as QuickFilter,
+            filterValidation = values[5] as ParsedDisplayFilter,
+            selectedPacketId = values[6] as Long?,
+            autoScroll = values[7] as Boolean,
+            resolveHostnames = values[8] as Boolean,
+            resolvedDomains = values[9] as Map<String, ResolvedHost>
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = SandboxUiState()
+    )
+
     val selectedPacket: StateFlow<CapturedPacket?> = combine(
         CaptureRepository.packets,
         _selectedPacketId
@@ -375,8 +461,19 @@ class WireTraceViewModel : ViewModel() {
         RootPromiscuousSniffer.setPromiscuousMode(enabled)
     }
 
+    fun setSandboxFilterQuery(query: String) {
+        _sandboxFilterQuery.value = query
+    }
+
+    fun setSandboxQuickFilter(filter: QuickFilter) {
+        _sandboxQuickFilter.value = filter
+    }
+
+    fun toggleSandboxAutoScroll() {
+        _sandboxAutoScroll.value = !_sandboxAutoScroll.value
+    }
+
     fun startRootSandboxCapture() {
-        _trafficScopeFilter.value = TrafficScopeFilter.ALL
         RootPromiscuousSniffer.startCapture()
     }
 
@@ -385,13 +482,16 @@ class WireTraceViewModel : ViewModel() {
     }
 
     fun filterToStream(stream: ConversationStream) {
-        _quickFilter.value = QuickFilter.ALL
-        _trafficScopeFilter.value = when (stream.captureSource) {
-            CaptureSource.LAN_PROMISCUOUS -> TrafficScopeFilter.LAN_ONLY
-            CaptureSource.DEVICE_VPN -> TrafficScopeFilter.PHONE_ONLY
-        }
         val portPart = if (stream.remotePort > 0) " && port == ${stream.remotePort}" else ""
-        _filterQuery.value = "ip.addr == ${stream.remoteIp}$portPart"
+        val expr = "ip.addr == ${stream.remoteIp}$portPart"
+        if (stream.captureSource == CaptureSource.LAN_PROMISCUOUS) {
+            _sandboxQuickFilter.value = QuickFilter.ALL
+            _sandboxFilterQuery.value = expr
+        } else {
+            _quickFilter.value = QuickFilter.ALL
+            _trafficScopeFilter.value = TrafficScopeFilter.PHONE_ONLY
+            _filterQuery.value = expr
+        }
     }
 
     fun clearCapture() {

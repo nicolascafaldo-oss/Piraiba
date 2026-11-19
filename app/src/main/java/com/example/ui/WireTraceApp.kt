@@ -37,6 +37,7 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Radar
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material.icons.rounded.WifiTethering
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
@@ -87,6 +88,7 @@ import androidx.navigation.compose.rememberNavController
 import com.example.R
 import com.example.capture.AlertConfigStore
 import com.example.capture.CaptureRepository
+import com.example.model.CaptureSource
 import com.example.model.ProbeType
 import com.example.model.QuickFilter
 import com.example.model.RootSandboxStatus
@@ -97,7 +99,7 @@ import com.example.ui.screens.AnalyticsScreen
 import com.example.ui.screens.CaptureScreen
 import com.example.ui.screens.FollowStreamDialog
 import com.example.ui.screens.PacketInspectorPane
-import com.example.ui.screens.PromiscuousSandboxDialog
+import com.example.ui.screens.PromiscuousSandboxScreen
 import com.example.ui.screens.StreamsScreen
 import com.example.ui.theme.WireTraceTheme
 import com.example.viewmodel.WireTraceViewModel
@@ -106,6 +108,7 @@ import kotlinx.coroutines.launch
 
 private object WireTraceRoutes {
     const val PACKETS = "packets"
+    const val SANDBOX = "sandbox"
     const val INSPECTOR = "inspector"
     const val STREAMS = "streams"
     const val ANALYTICS = "analytics"
@@ -130,6 +133,7 @@ fun WireTraceApp(
     val unreadAlertCount by viewModel.unreadAlertCount.collectAsStateWithLifecycle()
     val latestAlertEvent by viewModel.latestAlertEvent.collectAsStateWithLifecycle()
     val rootSandboxState by viewModel.rootSandboxState.collectAsStateWithLifecycle()
+    val sandboxUiState by viewModel.sandboxUiState.collectAsStateWithLifecycle()
 
     // The top bar must reflect EVERY capture backend, not just the VPN tunnel: with root
     // tcpdump or LAN multicast listen running (VPN off), the old VPN-only flag showed
@@ -137,6 +141,7 @@ fun WireTraceApp(
     // be offered whenever anything is capturing (stopVpnService is the master stop).
     val rootCaptureRunning = rootSandboxState.status == RootSandboxStatus.ROOT_RUNNING
     val anyCaptureActive = uiState.isCapturing || uiState.lanMulticastActive || rootCaptureRunning
+    val sandboxCaptureActive = uiState.lanMulticastActive || rootCaptureRunning
 
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
@@ -144,10 +149,10 @@ fun WireTraceApp(
     val navController = rememberNavController()
     var showMenu by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
-    var showPromiscuousSandbox by remember { mutableStateOf(false) }
     var pendingExportFilteredOnly by remember { mutableStateOf(false) }
     var followStreamKey by remember { mutableStateOf<String?>(null) }
     var vpnIssueDialogMessage by remember { mutableStateOf<String?>(null) }
+    var issueDialogIsVpn by remember { mutableStateOf(true) }
     var askedNotificationThisSession by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -167,6 +172,7 @@ fun WireTraceApp(
             // Clear BEFORE showing: the dialog is plain state, not tied to this effect's
             // lifetime, so clearing here can't cancel anything.
             CaptureRepository.clearStatusMessage()
+            issueDialogIsVpn = status.message.contains("VPN", ignoreCase = true)
             vpnIssueDialogMessage = status.message
         } else {
             // Show FIRST, clear AFTER. Clearing before showSnackbar changed this effect's
@@ -220,6 +226,7 @@ fun WireTraceApp(
                 }
             }
         } catch (e: Exception) {
+            issueDialogIsVpn = true
             vpnIssueDialogMessage = "Could not start the local capture service: ${e.message ?: "unknown error"}."
         }
     }
@@ -255,6 +262,7 @@ fun WireTraceApp(
         if (result.resultCode == Activity.RESULT_OK) {
             startVpnService()
         } else {
+            issueDialogIsVpn = true
             vpnIssueDialogMessage = "VPN access is required to capture traffic on-device without root. If the Android VPN prompt didn't appear or couldn't be accepted, check Settings → Network & internet → VPN to make sure no other VPN or Always-on VPN is locking the connection."
         }
     }
@@ -270,6 +278,7 @@ fun WireTraceApp(
         val prepareIntent = try {
             VpnService.prepare(hostContext)
         } catch (e: Exception) {
+            issueDialogIsVpn = true
             vpnIssueDialogMessage = "Android blocked the VPN permission check (${e.message ?: "restricted"}). If another VPN or Always-on VPN is active, disable it in Settings → Network & internet → VPN and retry."
             return
         }
@@ -277,6 +286,7 @@ fun WireTraceApp(
             try {
                 vpnPermissionLauncher.launch(prepareIntent)
             } catch (e: Exception) {
+                issueDialogIsVpn = true
                 vpnIssueDialogMessage = "Unable to launch the Android VPN consent dialog (${e.message ?: "unavailable"}). Open VPN Settings to check active VPN apps."
             }
         } else {
@@ -312,7 +322,7 @@ fun WireTraceApp(
                 onDismissRequest = { vpnIssueDialogMessage = null },
                 title = {
                     Text(
-                        text = "VPN Permission Needed",
+                        text = if (issueDialogIsVpn) "VPN Permission Needed" else "Capture Notice",
                         style = MaterialTheme.typography.titleLarge
                     )
                 },
@@ -323,29 +333,37 @@ fun WireTraceApp(
                     )
                 },
                 confirmButton = {
-                    Button(
-                        onClick = {
-                            vpnIssueDialogMessage = null
-                            requestStartCapture()
+                    if (issueDialogIsVpn) {
+                        Button(
+                            onClick = {
+                                vpnIssueDialogMessage = null
+                                requestStartCapture()
+                            }
+                        ) {
+                            Text("Retry Prompt")
                         }
-                    ) {
-                        Text("Retry Prompt")
+                    } else {
+                        Button(onClick = { vpnIssueDialogMessage = null }) {
+                            Text("OK")
+                        }
                     }
                 },
                 dismissButton = {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        TextButton(
-                            onClick = {
-                                vpnIssueDialogMessage = null
-                                runCatching {
-                                    context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                    if (issueDialogIsVpn) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(
+                                onClick = {
+                                    vpnIssueDialogMessage = null
+                                    runCatching {
+                                        context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+                                    }
                                 }
+                            ) {
+                                Text("VPN Settings")
                             }
-                        ) {
-                            Text("VPN Settings")
-                        }
-                        TextButton(onClick = { vpnIssueDialogMessage = null }) {
-                            Text("Close")
+                            TextButton(onClick = { vpnIssueDialogMessage = null }) {
+                                Text("Close")
+                            }
                         }
                     }
                 }
@@ -371,26 +389,10 @@ fun WireTraceApp(
                             putExtra(Intent.EXTRA_SUBJECT, "Piraíba Capture ($count packets)")
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
-                        context.startActivity(Intent.createChooser(shareIntent, "Share .pcap to Wireshark"))
+                        context.startActivity(Intent.createChooser(shareIntent, "Share .pcap"))
                     }
                 },
                 onDismiss = { showExportDialog = false }
-            )
-        }
-        if (showPromiscuousSandbox) {
-            PromiscuousSandboxDialog(
-                sandboxState = rootSandboxState,
-                lanMulticastActive = uiState.lanMulticastEnabled,
-                probeBusy = probeBusy,
-                onProbeRoot = viewModel::probeRootSandbox,
-                onSelectInterface = viewModel::setRootSandboxInterface,
-                onBpfFilterChange = viewModel::setRootSandboxBpfFilter,
-                onTogglePromiscuousMode = viewModel::setRootSandboxPromiscuous,
-                onStartRootCapture = viewModel::startRootSandboxCapture,
-                onStopRootCapture = viewModel::stopRootSandboxCapture,
-                onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
-                onRunLanSweep = { viewModel.runProbe(ProbeType.LAN_DISCOVERY) },
-                onDismiss = { showPromiscuousSandbox = false }
             )
         }
         if (followStreamKey != null) {
@@ -402,11 +404,15 @@ fun WireTraceApp(
                 resolvedDomains = uiState.resolvedDomains,
                 resolveHostnames = uiState.resolveHostnames,
                 onFilterToStream = {
-                    conversations.find { it.key == streamKey }?.let { stream ->
-                        viewModel.filterToStream(stream)
-                    }
+                    val matched = conversations.find { it.key == streamKey }
+                    matched?.let { viewModel.filterToStream(it) }
                     followStreamKey = null
-                    navController.navigate(WireTraceRoutes.PACKETS) {
+                    val targetRoute = if (matched?.captureSource == CaptureSource.LAN_PROMISCUOUS) {
+                        WireTraceRoutes.SANDBOX
+                    } else {
+                        WireTraceRoutes.PACKETS
+                    }
+                    navController.navigate(targetRoute) {
                         popUpTo(navController.graph.findStartDestination().id) { saveState = true }
                         launchSingleTop = true
                     }
@@ -559,21 +565,62 @@ fun WireTraceApp(
                                 selected = currentRoute == WireTraceRoutes.PACKETS,
                                 onClick = { navigateTab(WireTraceRoutes.PACKETS) },
                                 icon = { Icon(Icons.Rounded.Radar, contentDescription = null) },
-                                label = { Text(stringResource(R.string.nav_packets)) },
+                                label = {
+                                    Text(
+                                        text = stringResource(R.string.nav_packets),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
                                 modifier = Modifier.testTag("nav_packets")
+                            )
+                            NavigationBarItem(
+                                selected = currentRoute == WireTraceRoutes.SANDBOX,
+                                onClick = { navigateTab(WireTraceRoutes.SANDBOX) },
+                                icon = {
+                                    BadgedBox(
+                                        badge = {
+                                            if (sandboxCaptureActive) {
+                                                Badge()
+                                            }
+                                        }
+                                    ) {
+                                        Icon(Icons.Rounded.WifiTethering, contentDescription = null)
+                                    }
+                                },
+                                label = {
+                                    Text(
+                                        text = stringResource(R.string.nav_sandbox),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
+                                modifier = Modifier.testTag("nav_sandbox")
                             )
                             NavigationBarItem(
                                 selected = currentRoute == WireTraceRoutes.STREAMS,
                                 onClick = { navigateTab(WireTraceRoutes.STREAMS) },
                                 icon = { Icon(Icons.Rounded.SwapHoriz, contentDescription = null) },
-                                label = { Text(stringResource(R.string.nav_streams)) },
+                                label = {
+                                    Text(
+                                        text = stringResource(R.string.nav_streams),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
                                 modifier = Modifier.testTag("nav_streams")
                             )
                             NavigationBarItem(
                                 selected = currentRoute == WireTraceRoutes.ANALYTICS,
                                 onClick = { navigateTab(WireTraceRoutes.ANALYTICS) },
                                 icon = { Icon(Icons.Rounded.Analytics, contentDescription = null) },
-                                label = { Text(stringResource(R.string.nav_analytics)) },
+                                label = {
+                                    Text(
+                                        text = stringResource(R.string.nav_analytics),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
                                 modifier = Modifier.testTag("nav_analytics")
                             )
                             NavigationBarItem(
@@ -590,7 +637,13 @@ fun WireTraceApp(
                                         Icon(Icons.Rounded.NotificationsActive, contentDescription = null)
                                     }
                                 },
-                                label = { Text(stringResource(R.string.nav_alerts)) },
+                                label = {
+                                    Text(
+                                        text = stringResource(R.string.nav_alerts),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                },
                                 modifier = Modifier.testTag("nav_alerts")
                             )
                         }
@@ -611,6 +664,22 @@ fun WireTraceApp(
                                 onClick = { navigateTab(WireTraceRoutes.PACKETS) },
                                 icon = { Icon(Icons.Rounded.Radar, contentDescription = null) },
                                 label = { Text(stringResource(R.string.nav_packets)) }
+                            )
+                            NavigationRailItem(
+                                selected = currentRoute == WireTraceRoutes.SANDBOX,
+                                onClick = { navigateTab(WireTraceRoutes.SANDBOX) },
+                                icon = {
+                                    BadgedBox(
+                                        badge = {
+                                            if (sandboxCaptureActive) {
+                                                Badge()
+                                            }
+                                        }
+                                    ) {
+                                        Icon(Icons.Rounded.WifiTethering, contentDescription = null)
+                                    }
+                                },
+                                label = { Text(stringResource(R.string.nav_sandbox)) }
                             )
                             NavigationRailItem(
                                 selected = currentRoute == WireTraceRoutes.STREAMS,
@@ -656,7 +725,6 @@ fun WireTraceApp(
                                 Row(modifier = Modifier.fillMaxSize()) {
                                     CaptureScreen(
                                         uiState = uiState,
-                                        rootSandboxState = rootSandboxState,
                                         probeBusy = probeBusy,
                                         onStartCapture = ::requestStartCapture,
                                         onOpenPcap = { importPcapLauncher.launch(arrayOf("*/*")) },
@@ -666,8 +734,6 @@ fun WireTraceApp(
                                         onTrafficScopeSelected = viewModel::setTrafficScopeFilter,
                                         onToggleAutoScroll = viewModel::toggleAutoScroll,
                                         onToggleResolveHostnames = viewModel::toggleResolveHostnames,
-                                        onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
-                                        onOpenPromiscuousSandbox = { showPromiscuousSandbox = true },
                                         onSelectPacket = { pkt -> viewModel.selectPacket(pkt.id) },
                                         modifier = Modifier.weight(0.52f)
                                     )
@@ -688,7 +754,6 @@ fun WireTraceApp(
                             } else {
                                 CaptureScreen(
                                     uiState = uiState,
-                                    rootSandboxState = rootSandboxState,
                                     probeBusy = probeBusy,
                                     onStartCapture = ::requestStartCapture,
                                     onOpenPcap = { importPcapLauncher.launch(arrayOf("*/*")) },
@@ -698,8 +763,65 @@ fun WireTraceApp(
                                     onTrafficScopeSelected = viewModel::setTrafficScopeFilter,
                                     onToggleAutoScroll = viewModel::toggleAutoScroll,
                                     onToggleResolveHostnames = viewModel::toggleResolveHostnames,
+                                    onSelectPacket = { pkt ->
+                                        viewModel.selectPacket(pkt.id)
+                                        navController.navigate(WireTraceRoutes.INSPECTOR)
+                                    }
+                                )
+                            }
+                        }
+
+                        composable(WireTraceRoutes.SANDBOX) {
+                            if (isExpanded) {
+                                Row(modifier = Modifier.fillMaxSize()) {
+                                    PromiscuousSandboxScreen(
+                                        uiState = sandboxUiState,
+                                        probeBusy = probeBusy,
+                                        onFilterQueryChange = viewModel::setSandboxFilterQuery,
+                                        onQuickFilterSelected = viewModel::setSandboxQuickFilter,
+                                        onToggleAutoScroll = viewModel::toggleSandboxAutoScroll,
+                                        onToggleResolveHostnames = viewModel::toggleResolveHostnames,
+                                        onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
+                                        onRunLanSweep = { viewModel.runProbe(ProbeType.LAN_DISCOVERY) },
+                                        onProbeRoot = viewModel::probeRootSandbox,
+                                        onSelectInterface = viewModel::setRootSandboxInterface,
+                                        onBpfFilterChange = viewModel::setRootSandboxBpfFilter,
+                                        onTogglePromiscuousMode = viewModel::setRootSandboxPromiscuous,
+                                        onStartRootCapture = viewModel::startRootSandboxCapture,
+                                        onStopRootCapture = viewModel::stopRootSandboxCapture,
+                                        onSelectPacket = { pkt -> viewModel.selectPacket(pkt.id) },
+                                        modifier = Modifier.weight(0.52f)
+                                    )
+                                    VerticalDivider()
+                                    PacketInspectorPane(
+                                        packet = selectedPacket,
+                                        resolvedDomains = uiState.resolvedDomains,
+                                        resolveHostnames = uiState.resolveHostnames,
+                                        showBackButton = false,
+                                        onBack = {},
+                                        onFollowStream = { key -> followStreamKey = key },
+                                        onCopiedHex = { msg ->
+                                            coroutineScope.launch { snackbarHostState.showSnackbar(msg) }
+                                        },
+                                        modifier = Modifier.weight(0.48f)
+                                    )
+                                }
+                            } else {
+                                PromiscuousSandboxScreen(
+                                    uiState = sandboxUiState,
+                                    probeBusy = probeBusy,
+                                    onFilterQueryChange = viewModel::setSandboxFilterQuery,
+                                    onQuickFilterSelected = viewModel::setSandboxQuickFilter,
+                                    onToggleAutoScroll = viewModel::toggleSandboxAutoScroll,
+                                    onToggleResolveHostnames = viewModel::toggleResolveHostnames,
                                     onToggleLanMulticast = { viewModel.toggleLanMulticast(context) },
-                                    onOpenPromiscuousSandbox = { showPromiscuousSandbox = true },
+                                    onRunLanSweep = { viewModel.runProbe(ProbeType.LAN_DISCOVERY) },
+                                    onProbeRoot = viewModel::probeRootSandbox,
+                                    onSelectInterface = viewModel::setRootSandboxInterface,
+                                    onBpfFilterChange = viewModel::setRootSandboxBpfFilter,
+                                    onTogglePromiscuousMode = viewModel::setRootSandboxPromiscuous,
+                                    onStartRootCapture = viewModel::startRootSandboxCapture,
+                                    onStopRootCapture = viewModel::stopRootSandboxCapture,
                                     onSelectPacket = { pkt ->
                                         viewModel.selectPacket(pkt.id)
                                         navController.navigate(WireTraceRoutes.INSPECTOR)
@@ -730,7 +852,12 @@ fun WireTraceApp(
                                 onSelectStream = { stream -> followStreamKey = stream.key },
                                 onFilterToStream = { stream ->
                                     viewModel.filterToStream(stream)
-                                    navigateTab(WireTraceRoutes.PACKETS)
+                                    val target = if (stream.captureSource == CaptureSource.LAN_PROMISCUOUS) {
+                                        WireTraceRoutes.SANDBOX
+                                    } else {
+                                        WireTraceRoutes.PACKETS
+                                    }
+                                    navigateTab(target)
                                 }
                             )
                         }

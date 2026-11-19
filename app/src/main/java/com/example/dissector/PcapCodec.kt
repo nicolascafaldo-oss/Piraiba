@@ -13,7 +13,7 @@ import java.nio.ByteOrder
 /**
  * Standard libpcap (.pcap) binary encoder & decoder supporting LINKTYPE_RAW (101),
  * LINKTYPE_ETHERNET (1), LINKTYPE_LINUX_SLL (113), and LINKTYPE_LINUX_SLL2 (276).
- * Exported files open natively in desktop Wireshark, tcpdump, and tshark.
+ * Exported files open natively in standard desktop packet analyzers and tcpdump.
  */
 object PcapCodec {
 

@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.wiretrace.kqxmtb"
     minSdk = 24
     targetSdk = 36
-    versionCode = 4
-    versionName = "4.0"
+    versionCode = 9
+    versionName = "9.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

@@ -83,10 +83,10 @@ object RootPromiscuousSniffer {
             _state.update {
                 it.copy(
                     status = RootSandboxStatus.CHECKING,
-                    statusDetail = "Probing local environment for su root elevation and tcpdump..."
+                    statusDetail = "Checking local environment for su root elevation and tcpdump..."
                 )
             }
-            appendLog("Probing su & system tcpdump...")
+            appendLog("Checking su & system tcpdump...")
 
             val probeCmd = listOf(
                 "su", "-c",
@@ -98,7 +98,7 @@ object RootPromiscuousSniffer {
                 val finished = proc.waitFor(4, TimeUnit.SECONDS)
                 if (!finished) {
                     proc.destroyForcibly()
-                    error("su probe timed out waiting for root prompt")
+                    error("su check timed out waiting for root prompt")
                 }
                 val output = BufferedReader(InputStreamReader(proc.inputStream)).use { it.readText() }
                 proc.exitValue() to output
@@ -362,8 +362,11 @@ object RootPromiscuousSniffer {
         val rh = ByteArray(16)
         while (readFullyOrFalse(buffered, rh)) {
             val inclLen = readInt(rh, 8, littleEndian)
-            if (inclLen <= 0 || inclLen > 65536) {
+            if (inclLen < 0 || inclLen > 4 * 1024 * 1024) {
                 break
+            }
+            if (inclLen == 0) {
+                continue
             }
             val frame = ByteArray(inclLen)
             if (!readFullyOrFalse(buffered, frame)) {

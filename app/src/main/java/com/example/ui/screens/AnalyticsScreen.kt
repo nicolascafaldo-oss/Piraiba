@@ -22,12 +22,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Science
 import androidx.compose.material.icons.rounded.Speed
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -119,10 +117,79 @@ fun AnalyticsScreen(
 
         item {
             DiagnosticProbesCard(
-                isCapturing = uiState.isCapturing,
                 probeBusy = probeBusy,
                 onRunProbe = onRunProbe
             )
+        }
+    }
+}
+
+@Composable
+private fun DiagnosticProbesCard(
+    probeBusy: Boolean,
+    onRunProbe: (ProbeType) -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("diagnostic_probes_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Science,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.secondary
+                )
+                Column {
+                    Text(
+                        text = "Diagnostic Network Probes",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "Send real test packets to verify VPN tunnel or LAN broadcast capture.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            ProbeType.entries.forEach { probe ->
+                OutlinedButton(
+                    onClick = { onRunProbe(probe) },
+                    enabled = !probeBusy,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("analytics_probe_${probe.name.lowercase()}")
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.Start
+                    ) {
+                        Text(
+                            text = probe.label,
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold)
+                        )
+                        Text(
+                            text = probe.description,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -558,7 +625,7 @@ private fun DnsResolutionCacheCard(
 
             if (entries.isEmpty()) {
                 Text(
-                    text = "IP-to-domain mappings populate automatically from captured DNS A/AAAA answers, TLS SNI, HTTP Host headers, and reverse PTR lookups.",
+                    text = "IP-to-domain mappings populate passively from captured DNS A/AAAA/PTR answers, mDNS/SSDP broadcasts, TLS SNI, and HTTP Host headers.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -607,99 +674,6 @@ private fun DnsResolutionCacheCard(
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DiagnosticProbesCard(
-    isCapturing: Boolean,
-    probeBusy: Boolean,
-    onRunProbe: (ProbeType) -> Unit
-) {
-    Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceContainer,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.Dns,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Column {
-                    Text(
-                        text = "Live Network Probes",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Text(
-                        text = if (isCapturing) {
-                            "Fire real DNS, HTTP, or TLS traffic through tun0 to verify packet dissection immediately."
-                        } else {
-                            "Start Capture first to intercept probe packets in real time."
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = { onRunProbe(ProbeType.DNS_QUERY) },
-                    enabled = isCapturing && !probeBusy,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 48.dp)
-                ) {
-                    Icon(Icons.Rounded.Bolt, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("DNS")
-                }
-                OutlinedButton(
-                    onClick = { onRunProbe(ProbeType.HTTP_GET) },
-                    enabled = isCapturing && !probeBusy,
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 48.dp)
-                ) {
-                    Text("HTTP")
-                }
-                OutlinedButton(
-                    onClick = { onRunProbe(ProbeType.HTTPS_TLS) },
-                    enabled = isCapturing && !probeBusy,
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 48.dp)
-                ) {
-                    Text("TLS")
-                }
-            }
-            OutlinedButton(
-                onClick = { onRunProbe(ProbeType.LAN_DISCOVERY) },
-                enabled = !probeBusy,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-            ) {
-                Text("LAN Discovery Sweep (mDNS + SSDP)")
             }
         }
     }

@@ -15,7 +15,7 @@ data class ParsedDisplayFilter(
 )
 
 /**
- * Evaluates Wireshark-style display filter expressions and deep payload keyword searches:
+ * Evaluates display filter expressions and deep payload keyword searches:
  * Examples:
  * - "dns", "tls", "http", "tcp", "udp", "quic", "icmp", "out", "in"
  * - "ip.addr == 8.8.8.8", "ip.src == 10.1.10.1", "ip.dst == 1.1.1.1"

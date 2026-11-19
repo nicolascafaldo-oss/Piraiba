@@ -360,7 +360,7 @@ fun ExportPcapDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    text = "Saves standard libpcap binary format compatible with Wireshark, tcpdump, and tshark.",
+                    text = "Saves standard libpcap (.pcap) binary format compatible with standard desktop packet analyzers and tcpdump.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

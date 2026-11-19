@@ -160,15 +160,15 @@ enum class QuickFilter(val label: String) {
 }
 
 enum class ProbeType(val label: String, val description: String) {
-    DNS_QUERY("DNS Lookup", "Send live UDP/53 DNS A-query to 8.8.8.8"),
-    HTTP_GET("HTTP Request", "Send live TCP/80 GET request to example.com"),
-    HTTPS_TLS("TLS Handshake", "Perform live TCP/443 TLS 1.3 handshake with SNI"),
-    LAN_DISCOVERY("LAN Sweep", "Send mDNS & SSDP multicast discovery probes on Wi-Fi")
+    DNS_QUERY("DNS Probe", "Queries 8.8.8.8 for an A-record"),
+    HTTP_GET("HTTP Probe", "Requests HTTP headers from example.com"),
+    HTTPS_TLS("TLS Probe", "Performs a TLS handshake with example.com"),
+    LAN_DISCOVERY("LAN Sweep", "Sends mDNS & SSDP local network discovery queries")
 }
 
 enum class RootSandboxStatus(val label: String) {
-    UNCHECKED("Not Probed"),
-    CHECKING("Probing Root..."),
+    UNCHECKED("Not Checked"),
+    CHECKING("Checking Root..."),
     ROOT_READY("Root Ready"),
     ROOT_RUNNING("Root Capture Active"),
     NO_ROOT_OR_DENIED("No Root Access"),
@@ -185,6 +185,6 @@ data class RootSandboxState(
     val bpfFilter: String = "",
     val promiscuousMode: Boolean = true,
     val capturedFrames: Long = 0L,
-    val statusDetail: String = "Tap Probe Sandbox to check for system su + tcpdump on this device.",
+    val statusDetail: String = "Tap Check Root to inspect local su + tcpdump availability on this device.",
     val consoleLogs: List<String> = emptyList()
 )
