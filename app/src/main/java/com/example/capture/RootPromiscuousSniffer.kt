@@ -362,7 +362,7 @@ object RootPromiscuousSniffer {
         val rh = ByteArray(16)
         while (readFullyOrFalse(buffered, rh)) {
             val inclLen = readInt(rh, 8, littleEndian)
-            if (inclLen < 0 || inclLen > 4 * 1024 * 1024) {
+            if (inclLen < 0 || inclLen > 1024 * 1024) {
                 break
             }
             if (inclLen == 0) {
